@@ -6,8 +6,8 @@ For information on how to use and develop Browsertrix Crawler, see the hosted [B
 
 For information on how to build the docs locally, see the [docs page](docs/docs/develop/docs.md).
 
-
 ## Support
+
 Initial support for 0.x version of Browsertrix Crawler, was provided by [Kiwix](https://kiwix.org/). The initial functionality for Browsertrix Crawler was developed to support the [zimit](https://github.com/openzim/zimit) project in a collaboration between Webrecorder and Kiwix, and this project has been split off from Zimit into a core component of Webrecorder.
 
 Additional support for Browsertrix Crawler, including for the development of the 0.4.x version has been provided by [Portico](https://www.portico.org/).
@@ -15,3 +15,9 @@ Additional support for Browsertrix Crawler, including for the development of the
 ## License
 
 [AGPLv3](https://www.gnu.org/licenses/agpl-3.0) or later, see [LICENSE](LICENSE) for more details.
+
+# Custom Browsertrix image
+
+- Changes made to Entrypoint within the Dockerfile to point to a new bash script
+- New bash script will aws s3 copy target yaml to browsertrix config directory
+- --config flag set within the bash script to use /config for it's crawl
