@@ -1,0 +1,51 @@
+name: Node.js CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x]
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: install requirements
+        run: yarn install
+      - name: run linter
+        run: yarn lint && yarn format
+
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x]
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: install requirements
+        run: yarn install
+      - name: build js
+        run: yarn run tsc
+      - name: build docker
+        run: docker-compose build
+      - name: run all tests as root
+        run: sudo yarn test
+      - name: run saved state + qa compare test as non-root - with volume owned by current user
+        run: |
+          sudo rm -rf ./test-crawls
+          mkdir test-crawls
+          sudo yarn test ./tests/saved-state.test.js ./tests/qa_compare.test.js
