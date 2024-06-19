@@ -377,7 +377,7 @@ class ArgParser {
 
       redisStoreUrl: {
         describe:
-          "If set, url for remote redis server to store state. Otherwise, using in-memory store",
+          "If set, url for remote redis server to store state. Otherwise, using local redis instance",
         type: "string",
         default: "redis://localhost:6379/0",
       },
@@ -498,7 +498,8 @@ class ArgParser {
 
       failOnFailedSeed: {
         describe:
-          "If set, crawler will fail with exit code 1 if any seed fails",
+          "If set, crawler will fail with exit code 1 if any seed fails. When combined with --failOnInvalidStatus," +
+          "will result in crawl failing with exit code 1 if any seed has a 4xx/5xx response",
         type: "boolean",
         default: false,
       },
@@ -512,8 +513,8 @@ class ArgParser {
 
       failOnInvalidStatus: {
         describe:
-          "If set, will treat pages with non-200 response as failures. When combined with --failOnFailedLimit or --failOnFailedSeed" +
-          "may result in crawl failing due to non-200 responses",
+          "If set, will treat pages with 4xx or 5xx response as failures. When combined with --failOnFailedLimit" +
+          " or --failOnFailedSeed may result in crawl failing due to non-200 responses",
         type: "boolean",
         default: false,
       },
@@ -542,6 +543,18 @@ class ArgParser {
           "service worker handling: disabled, enabled, or disabled with custom profile",
         choices: SERVICE_WORKER_OPTS,
         default: "disabled",
+      },
+
+      proxyServer: {
+        describe:
+          "if set, will use specified proxy server. Takes precedence over any env var proxy settings",
+        type: "string",
+      },
+
+      dryRun: {
+        describe:
+          "If true, no archive data is written to disk, only pages and logs (and optionally saved state).",
+        type: "boolean",
       },
 
       qaSource: {
@@ -677,17 +690,20 @@ class ArgParser {
         } catch (e) {
           if (argv.failOnFailedSeed) {
             logger.fatal(
-              `Invalid Seed "${seed.url}" specified, aborting crawl.`,
+              "Invalid seed specified, aborting crawl",
+              { url: seed.url },
+              "general",
+              1,
             );
           }
         }
       }
 
       if (!argv.scopedSeeds.length) {
-        logger.fatal("No valid seeds specified, aborting crawl.");
+        logger.fatal("No valid seeds specified, aborting crawl");
       }
     } else if (!argv.qaSource) {
-      logger.fatal("--qaSource required for QA mode!");
+      logger.fatal("--qaSource required for QA mode");
     }
 
     // Resolve statsFilename

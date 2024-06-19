@@ -3,6 +3,8 @@ import { getStatusText } from "@webrecorder/wabac/src/utils.js";
 
 import { Protocol } from "puppeteer-core";
 import { postToGetUrl } from "warcio";
+import { HTML_TYPES } from "./constants.js";
+import { Response } from "undici";
 
 const CONTENT_LENGTH = "content-length";
 const CONTENT_TYPE = "content-type";
@@ -148,12 +150,17 @@ export class RequestResponseInfo {
     }
   }
 
+  isRedirectStatus() {
+    return this.status >= 300 && this.status < 400 && this.status !== 304;
+  }
+
   isSelfRedirect() {
-    if (this.status < 300 || this.status >= 400 || this.status === 304) {
+    if (!this.isRedirectStatus()) {
       return false;
     }
+
     try {
-      const headers = new Headers(this.responseHeaders);
+      const headers = new Headers(this.getResponseHeadersDict());
       const location = headers.get("location") || "";
       const redirUrl = new URL(location, this.url).href;
       return this.url === redirUrl;
@@ -225,15 +232,17 @@ export class RequestResponseInfo {
 
       for (const header of headersList) {
         let headerName = header.name.toLowerCase();
-        if (EXCLUDE_HEADERS.includes(headerName)) {
-          headerName = "x-orig-" + headerName;
+        if (header.name.startsWith(":")) {
           continue;
         }
         if (actualContentLength && headerName === CONTENT_LENGTH) {
           headersDict[headerName] = "" + actualContentLength;
           continue;
         }
-        headersDict[headerName] = header.value.replace(/\n/g, ", ");
+        if (EXCLUDE_HEADERS.includes(headerName)) {
+          headerName = "x-orig-" + headerName;
+        }
+        headersDict[headerName] = this._encodeHeaderValue(header.value);
       }
     }
 
@@ -247,16 +256,18 @@ export class RequestResponseInfo {
         continue;
       }
       const keyLower = key.toLowerCase();
-      if (EXCLUDE_HEADERS.includes(keyLower)) {
-        headersDict["x-orig-" + key] = headersDict[key];
-        delete headersDict[key];
-        continue;
-      }
       if (actualContentLength && keyLower === CONTENT_LENGTH) {
         headersDict[key] = "" + actualContentLength;
         continue;
       }
-      headersDict[key] = headersDict[key].replace(/\n/g, ", ");
+      const value = this._encodeHeaderValue(headersDict[key]);
+
+      if (EXCLUDE_HEADERS.includes(keyLower)) {
+        headersDict["x-orig-" + key] = value;
+        delete headersDict[key];
+      } else {
+        headersDict[key] = value;
+      }
     }
 
     return headersDict;
@@ -324,7 +335,7 @@ export class RequestResponseInfo {
 
     const convData = {
       url: this.url,
-      headers: new Headers(this.requestHeaders),
+      headers: new Headers(this.getRequestHeadersDict()),
       method: this.method,
       postData: this.postData || "",
     };
@@ -348,4 +359,29 @@ export class RequestResponseInfo {
 
     return this.url;
   }
+
+  _encodeHeaderValue(value: string) {
+    // check if not ASCII, then encode, replace encoded newlines
+    // eslint-disable-next-line no-control-regex
+    if (!/^[\x00-\x7F]*$/.test(value)) {
+      value = encodeURI(value).replace(/%0A/g, ", ");
+    }
+    // replace newlines with spaces
+    return value.replace(/\n/g, ", ");
+  }
+}
+
+export function isHTMLContentType(contentType: string | null) {
+  // just load if no content-type
+  if (!contentType) {
+    return true;
+  }
+
+  const mime = contentType.split(";")[0];
+
+  if (HTML_TYPES.includes(mime)) {
+    return true;
+  }
+
+  return false;
 }

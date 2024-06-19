@@ -6,7 +6,9 @@ import PQueue from "p-queue";
 
 import { logger, formatErr } from "./logger.js";
 import { sleep, timedRun, timestampNow } from "./timing.js";
-import { RequestResponseInfo } from "./reqresp.js";
+import { RequestResponseInfo, isHTMLContentType } from "./reqresp.js";
+
+import { fetch, Response } from "undici";
 
 // @ts-expect-error TODO fill in why error is expected
 import { baseRules as baseDSRules } from "@webrecorder/wabac/src/rewrite/index.js";
@@ -75,11 +77,23 @@ export type AsyncFetchOptions = {
   filter?: (resp: Response) => boolean;
   ignoreDupe?: boolean;
   maxFetchSize?: number;
+  manualRedirect?: boolean;
 };
 
 // =================================================================
-export type ResponseStreamAsyncFetchOptions = AsyncFetchOptions & {
+export type DirectFetchRequest = {
+  url: string;
+  headers: Record<string, string>;
   cdp: CDPSession;
+};
+
+// =================================================================
+export type NetworkLoadAsyncFetchOptions = AsyncFetchOptions & {
+  cdp: CDPSession;
+};
+
+// =================================================================
+export type ResponseStreamAsyncFetchOptions = NetworkLoadAsyncFetchOptions & {
   requestId: string;
 };
 
@@ -238,7 +252,7 @@ export class Recorder {
   handleResponseReceived(params: Protocol.Network.ResponseReceivedEvent) {
     const { requestId, response, type } = params;
 
-    const { mimeType, url } = response;
+    const { mimeType, url, headers } = response;
 
     logNetwork("Network.responseReceived", {
       requestId,
@@ -247,6 +261,10 @@ export class Recorder {
     });
 
     if (mimeType === MIME_EVENT_STREAM) {
+      return;
+    }
+
+    if (this.shouldSkip(headers, url, undefined, type)) {
       return;
     }
 
@@ -391,8 +409,8 @@ export class Recorder {
         // check if this is a false positive -- a valid download that's already been fetched
         // the abort is just for page, but download will succeed
         if (type === "Document" && reqresp.isValidBinary()) {
-          this.serializeToWARC(reqresp);
-          //} else if (url) {
+          this.removeReqResp(requestId);
+          return this.serializeToWARC(reqresp);
         } else if (
           url &&
           reqresp.requestHeaders &&
@@ -424,8 +442,8 @@ export class Recorder {
     }
     reqresp.status = 0;
     reqresp.errorText = errorText;
-
     this.addPageRecord(reqresp);
+
     this.removeReqResp(requestId);
   }
 
@@ -1062,12 +1080,23 @@ export class Recorder {
     this.writer.writeRecordPair(responseRecord, requestRecord);
   }
 
-  async directFetchCapture(
-    url: string,
-  ): Promise<{ fetched: boolean; mime: string }> {
+  async directFetchCapture({ url, headers, cdp }: DirectFetchRequest): Promise<{
+    fetched: boolean;
+    mime: string;
+    ts: Date;
+  }> {
     const reqresp = new RequestResponseInfo("0");
+    const ts = new Date();
+
+    const cookie = await this.getCookieString(cdp, url);
+    if (cookie) {
+      headers["Cookie"] = cookie;
+    }
+
     reqresp.url = url;
     reqresp.method = "GET";
+    reqresp.requestHeaders = headers;
+    reqresp.ts = ts;
 
     logger.debug(
       "Directly fetching page URL without browser",
@@ -1075,8 +1104,21 @@ export class Recorder {
       "recorder",
     );
 
-    const filter = (resp: Response) =>
-      resp.status === 200 && !resp.headers.get("set-cookie");
+    let mime: string = "";
+
+    const filter = (resp: Response) => {
+      // only direct load 200 responses
+      if (resp.status !== 200) {
+        return false;
+      }
+
+      const ct = resp.headers.get("content-type");
+      if (ct) {
+        mime = ct.split(";")[0];
+      }
+
+      return !isHTMLContentType(mime);
+    };
 
     // ignore dupes: if previous URL was not a page, still load as page. if previous was page,
     // should not get here, as dupe pages tracked via seen list
@@ -1087,16 +1129,28 @@ export class Recorder {
       networkId: "0",
       filter,
       ignoreDupe: true,
+      manualRedirect: true,
     });
     const res = await fetcher.load();
 
-    const mime =
-      (reqresp.responseHeaders &&
-        reqresp.responseHeaders["content-type"] &&
-        reqresp.responseHeaders["content-type"].split(";")[0]) ||
-      "";
+    this.addPageRecord(reqresp);
 
-    return { fetched: res === "fetched", mime };
+    if (url === this.pageUrl && !this.pageInfo.ts) {
+      logger.debug("Setting page timestamp", { ts, url });
+      this.pageInfo.ts = ts;
+    }
+
+    return { fetched: res === "fetched", mime, ts };
+  }
+
+  async getCookieString(cdp: CDPSession, url: string) {
+    const cookieList: string[] = [];
+    const { cookies } = await cdp.send("Network.getCookies", { urls: [url] });
+    for (const { name, value } of cookies) {
+      cookieList.push(`${name}=${value}`);
+    }
+
+    return cookieList.join(";");
   }
 }
 
@@ -1115,6 +1169,8 @@ class AsyncFetcher {
   tempdir: string;
   filename: string;
 
+  manualRedirect = false;
+
   constructor({
     tempdir,
     reqresp,
@@ -1124,6 +1180,7 @@ class AsyncFetcher {
     filter = undefined,
     ignoreDupe = false,
     maxFetchSize = MAX_BROWSER_DEFAULT_FETCH_SIZE,
+    manualRedirect = false,
   }: AsyncFetchOptions) {
     this.reqresp = reqresp;
     this.reqresp.expectedSize = expectedSize;
@@ -1142,6 +1199,8 @@ class AsyncFetcher {
     );
 
     this.maxFetchSize = maxFetchSize;
+
+    this.manualRedirect = manualRedirect;
   }
 
   async load() {
@@ -1268,7 +1327,7 @@ class AsyncFetcher {
       if (e.message === "response-filtered-out") {
         throw e;
       }
-      logger.error(
+      logger.debug(
         "Streaming Fetch Error",
         { url, networkId, filename, ...formatErr(e), ...logDetails },
         "recorder",
@@ -1277,9 +1336,9 @@ class AsyncFetcher {
       reqresp.status = 0;
       reqresp.errorText = e.message;
     } finally {
+      recorder.addPageRecord(reqresp);
       // exclude direct fetch request with fake id
       if (networkId !== "0") {
-        recorder.addPageRecord(reqresp);
         recorder.removeReqResp(networkId);
       }
     }
@@ -1307,6 +1366,7 @@ class AsyncFetcher {
       headers,
       body: reqresp.postData || undefined,
       signal,
+      redirect: this.manualRedirect ? "manual" : "follow",
     });
 
     if (this.filter && !this.filter(resp) && abort) {
@@ -1323,6 +1383,7 @@ class AsyncFetcher {
     }
 
     if (reqresp.expectedSize === 0) {
+      reqresp.fillFetchResponse(resp);
       reqresp.payload = new Uint8Array();
       return;
     } else if (!resp.body) {
@@ -1422,7 +1483,7 @@ class ResponseStreamAsyncFetcher extends AsyncFetcher {
 class NetworkLoadStreamAsyncFetcher extends AsyncFetcher {
   cdp: CDPSession;
 
-  constructor(opts: ResponseStreamAsyncFetchOptions) {
+  constructor(opts: NetworkLoadAsyncFetchOptions) {
     super(opts);
     this.cdp = opts.cdp;
   }
