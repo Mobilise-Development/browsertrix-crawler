@@ -149,7 +149,7 @@ declare module "ioredis" {
 }
 
 // ============================================================================
-type SaveState = {
+export type SaveState = {
   done?: number | string[];
   finished: string[];
   queued: string[];
@@ -429,7 +429,9 @@ return inx;
             // can happen async w/o slowing down crawling
             // each page is still checked if in scope before crawling, even while
             // queue is being filtered
-            this.filterQueue(regex);
+            this.filterQueue(regex).catch((e) =>
+              logger.warn("filtering queue error", e, "exclusion"),
+            );
             break;
 
           case "removeExclusion":
@@ -827,12 +829,12 @@ return inx;
     return await this.redis.zcard(this.qkey);
   }
 
-  async addIfNoDupe(key: string, value: string) {
-    return (await this.redis.sadd(key, value)) === 1;
+  async addIfNoDupe(key: string, url: string, status: number) {
+    return (await this.redis.sadd(key, status + "|" + url)) === 1;
   }
 
-  async removeDupe(key: string, value: string) {
-    return await this.redis.srem(key, value);
+  async removeDupe(key: string, url: string, status: number) {
+    return await this.redis.srem(key, status + "|" + url);
   }
 
   async logError(error: string) {

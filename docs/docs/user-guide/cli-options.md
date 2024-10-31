@@ -43,9 +43,9 @@ Options:
                                                                            tom"]
       --scopeIncludeRx, --include           Regex of page URLs that should be in
                                             cluded in the crawl (defaults to the
-                                             immediate directory of URL)
+                                             immediate directory of URL)[string]
       --scopeExcludeRx, --exclude           Regex of page URLs that should be ex
-                                            cluded from the crawl.
+                                            cluded from the crawl.      [string]
       --allowHashUrls                       Allow Hashtag URLs, useful for singl
                                             e-page-application crawling or when
                                             different hashtags load dynamic cont
@@ -56,14 +56,14 @@ Options:
                                             an iframe      [array] [default: []]
       --blockMessage                        If specified, when a URL is blocked,
                                              a record with this error message is
-                                             added instead              [string]
+                                             added instead[string] [default: ""]
       --blockAds, --blockads                If set, block advertisements from be
                                             ing loaded (based on Stephen Black's
                                              blocklist)
                                                       [boolean] [default: false]
       --adBlockMessage                      If specified, when an ad is blocked,
                                              a record with this error message is
-                                             added instead              [string]
+                                             added instead[string] [default: ""]
   -c, --collection                          Collection name to crawl to (replay
                                             will be accessible under this name i
                                             n pywb preview)
@@ -79,7 +79,7 @@ Options:
       ineWarc                                         [boolean] [default: false]
       --rolloverSize                        If set, declare the rollover size
                                                   [number] [default: 1000000000]
-      --generateWACZ, --generatewacz, --ge  If set, generate wacz
+      --generateWACZ, --generatewacz, --ge  If set, generate WACZ on disk
       nerateWacz                                      [boolean] [default: false]
       --logging                             Logging options for crawler, can inc
                                             lude: stats (enabled by default), js
@@ -94,15 +94,15 @@ Options:
   , "state", "redis", "storage", "text", "exclusion", "screenshots", "screencast
   ", "originOverride", "healthcheck", "browser", "blocking", "behavior", "behavi
   orScript", "jsError", "fetch", "pageStatus", "memoryStatus", "crawlStatus", "l
-                                       inks", "sitemap", "replay"] [default: []]
+                      inks", "sitemap", "wacz", "replay", "proxy"] [default: []]
       --logExcludeContext                   Comma-separated list of contexts to
                                             NOT include in logs
   [array] [choices: "general", "worker", "recorder", "recorderNetwork", "writer"
   , "state", "redis", "storage", "text", "exclusion", "screenshots", "screencast
   ", "originOverride", "healthcheck", "browser", "blocking", "behavior", "behavi
   orScript", "jsError", "fetch", "pageStatus", "memoryStatus", "crawlStatus", "l
-  inks", "sitemap", "replay"] [default: ["recorderNetwork","jsError","screencast
-                                                                             "]]
+  inks", "sitemap", "wacz", "replay", "proxy"] [default: ["recorderNetwork","jsE
+                                                            rror","screencast"]]
       --text                                Extract initial (default) or final t
                                             ext to pages.jsonl or WARC resource
                                             record(s)
@@ -127,15 +127,15 @@ Options:
                                              those greater than or equal to (>=)
                                              provided ISO Date string (YYYY-MM-D
                                             D or YYYY-MM-DDTHH:MM:SS or partial
-                                            date)
+                                            date)                       [string]
       --sitemapToDate, --sitemapTo          If set, filter URLs from sitemaps to
                                              those less than or equal to (<=) pr
                                             ovided ISO Date string (YYYY-MM-DD o
                                             r YYYY-MM-DDTHH:MM:SS or partial dat
-                                            e)
+                                            e)                          [string]
       --statsFilename                       If set, output stats as JSON to this
                                              file. (Relative filename resolves t
-                                            o crawl working directory)
+                                            o crawl working directory)  [string]
       --behaviors                           Which background behaviors to enable
                                              on each page
   [array] [choices: "autoplay", "autofetch", "autoscroll", "siteSpecific"] [defa
@@ -155,9 +155,9 @@ Options:
                                                            [number] [default: 0]
       --dedupPolicy                         Deduplication policy
                  [string] [choices: "skip", "revisit", "keep"] [default: "skip"]
-      --profile                             Path to tar.gz file which will be ex
-                                            tracted and used as the browser prof
-                                            ile                         [string]
+      --profile                             Path or HTTP(S) URL to tar.gz file w
+                                            hich contains the browser profile di
+                                            rectory                     [string]
       --screenshot                          Screenshot options for crawler, can
                                             include: view, thumbnail, fullPage
                 [array] [choices: "view", "thumbnail", "fullPage"] [default: []]
@@ -172,8 +172,8 @@ Options:
       --warcInfo, --warcinfo                Optional fields added to the warcinf
                                             o record in combined WARCs
       --redisStoreUrl                       If set, url for remote redis server
-                                            to store state. Otherwise, using in-
-                                            memory store
+                                            to store state. Otherwise, using loc
+                                            al redis instance
                                   [string] [default: "redis://localhost:6379/0"]
       --saveState                           If the crawl state should be seriali
                                             zed to the crawls/ directory. Defaul
@@ -252,19 +252,30 @@ Options:
       --debugAccessRedis                    if set, runs internal redis without
                                             protected mode to allow external acc
                                             ess (for debugging)        [boolean]
+      --debugAccessBrowser                  if set, allow debugging browser on p
+                                            ort 9222 via CDP           [boolean]
       --warcPrefix                          prefix for WARC files generated, inc
                                             luding WARCs added to WACZ  [string]
       --serviceWorker, --sw                 service worker handling: disabled, e
                                             nabled, or disabled with custom prof
                                             ile
    [choices: "disabled", "disabled-if-profile", "enabled"] [default: "disabled"]
-      --dryRun                              If true, no data is written to disk,
-                                             only logs                 [boolean]
+      --proxyServer                         if set, will use specified proxy ser
+                                            ver. Takes precedence over any env v
+                                            ar proxy settings           [string]
+      --dryRun                              If true, no archive data is written
+                                            to disk, only pages and logs (and op
+                                            tionally saved state).     [boolean]
       --qaSource                            Required for QA mode. Source (WACZ o
                                             r multi WACZ) for QA        [string]
       --qaDebugImageDiff                    if specified, will write crawl.png,
                                             replay.png and diff.png for each pag
                                             e where they're different  [boolean]
+      --sshProxyPrivateKeyFile              path to SSH private key for SOCKS5 o
+                                            ver SSH proxy connection    [string]
+      --sshProxyKnownHostsFile              path to SSH known hosts file for SOC
+                                            KS5 over SSH proxy connection
+                                                                        [string]
       --config                              Path to YAML config file
 ```
 
@@ -272,32 +283,37 @@ Options:
 
 ```
 Options:
-  --help             Show help                                         [boolean]
-  --version          Show version number                               [boolean]
-  --url              The URL of the login page               [string] [required]
-  --user             The username for the login. If not specified, will be promp
-                     ted
-  --password         The password for the login. If not specified, will be promp
-                     ted (recommended)
-  --filename         The filename for the profile tarball, stored within /crawls
-                     /profiles if absolute path not provided
+  --help                    Show help                                  [boolean]
+  --version                 Show version number                        [boolean]
+  --url                     The URL of the login page        [string] [required]
+  --user                    The username for the login. If not specified, will b
+                            e prompted
+  --password                The password for the login. If not specified, will b
+                            e prompted (recommended)
+  --filename                The filename for the profile tarball, stored within
+                            /crawls/profiles if absolute path not provided
                                     [default: "/crawls/profiles/profile.tar.gz"]
-  --debugScreenshot  If specified, take a screenshot after login and save as thi
-                     s filename
-  --headless         Run in headless mode, otherwise start xvfb
+  --debugScreenshot         If specified, take a screenshot after login and save
+                             as this filename
+  --headless                Run in headless mode, otherwise start xvfb
                                                       [boolean] [default: false]
-  --automated        Start in automated mode, no interactive browser
+  --automated               Start in automated mode, no interactive browser
                                                       [boolean] [default: false]
-  --interactive      Deprecated. Now the default option!
+  --interactive             Deprecated. Now the default option!
                                                       [boolean] [default: false]
-  --shutdownWait     Shutdown browser in interactive after this many seconds, if
-                      no pings received                    [number] [default: 0]
-  --profile          Path to tar.gz file which will be extracted and used as the
-                      browser profile                                   [string]
-  --windowSize       Browser window dimensions, specified as: width,height
-                                                 [string] [default: "1360,1020"]
-  --proxy                                             [boolean] [default: false]
-  --cookieDays       If >0, set all cookies, including session cookies, to have
-                     this duration in days before saving profile
+  --shutdownWait            Shutdown browser in interactive after this many seco
+                            nds, if no pings received      [number] [default: 0]
+  --profile                 Path or HTTP(S) URL to tar.gz file which contains th
+                            e browser profile directory   [string] [default: ""]
+  --windowSize              Browser window dimensions, specified as: width,heigh
+                            t                    [string] [default: "1360,1020"]
+  --cookieDays              If >0, set all cookies, including session cookies, t
+                            o have this duration in days before saving profile
                                                            [number] [default: 7]
+  --proxyServer             if set, will use specified proxy server. Takes prece
+                            dence over any env var proxy settings       [string]
+  --sshProxyPrivateKeyFile  path to SSH private key for SOCKS5 over SSH proxy co
+                            nnection                                    [string]
+  --sshProxyKnownHostsFile  path to SSH known hosts file for SOCKS5 over SSH pro
+                            xy connection                               [string]
 ```

@@ -9,7 +9,7 @@ import path from "path";
 import { LogContext, logger } from "./logger.js";
 import { initStorage } from "./storage.js";
 
-import type { ServiceWorkerOpt } from "./constants.js";
+import { DISPLAY, type ServiceWorkerOpt } from "./constants.js";
 
 import puppeteer, {
   Frame,
@@ -93,6 +93,10 @@ export class Browser {
       args.push("--disable-site-isolation-trials");
     }
 
+    if (!headless) {
+      args.push(`--display=${DISPLAY}`);
+    }
+
     let defaultViewport = null;
 
     if (process.env.GEOMETRY) {
@@ -109,7 +113,7 @@ export class Browser {
       headless,
       executablePath: this.getBrowserExe(),
       ignoreDefaultArgs: ["--enable-automation", "--hide-scrollbars"],
-      ignoreHTTPSErrors: true,
+      acceptInsecureCerts: true,
       handleSIGHUP: signals,
       handleSIGINT: signals,
       handleSIGTERM: signals,
@@ -136,11 +140,6 @@ export class Browser {
   }
 
   async setupPage({ page }: { page: Page; cdp: CDPSession }) {
-    await this.addInitScript(
-      page,
-      'Object.defineProperty(navigator, "webdriver", {value: false});',
-    );
-
     switch (this.swOpt) {
       case "disabled":
         logger.debug("Service Workers: always disabled", {}, "browser");
@@ -372,8 +371,8 @@ export class Browser {
     }
   }
 
-  addInitScript(page: Page, script: string) {
-    return page.evaluateOnNewDocument(script);
+  async addInitScript(page: Page, script: string) {
+    await page.evaluateOnNewDocument(script);
   }
 
   async checkScript(cdp: CDPSession, filename: string, script: string) {

@@ -1,5 +1,4 @@
-// @ts-expect-error TODO fill in why error is expected
-import { getStatusText } from "@webrecorder/wabac/src/utils.js";
+import { getCustomRewriter, getStatusText } from "@webrecorder/wabac";
 
 import { Protocol } from "puppeteer-core";
 import { postToGetUrl } from "warcio";
@@ -7,6 +6,8 @@ import { HTML_TYPES } from "./constants.js";
 import { Response } from "undici";
 
 const CONTENT_LENGTH = "content-length";
+const CONTENT_RANGE = "content-range";
+const RANGE = "range";
 const CONTENT_TYPE = "content-type";
 const EXCLUDE_HEADERS = ["content-encoding", "transfer-encoding"];
 
@@ -46,14 +47,13 @@ export class RequestResponseInfo {
   responseHeadersText?: string;
 
   payload?: Uint8Array;
+  isRemoveRange = false;
 
   // misc
   fromServiceWorker = false;
   fromCache = false;
 
   frameId?: string;
-
-  fetch = false;
 
   resourceType?: string;
 
@@ -65,6 +65,9 @@ export class RequestResponseInfo {
   readSize: number = 0;
   expectedSize: number = 0;
 
+  // set to true to indicate request intercepted via Fetch.requestPaused
+  intercepting = false;
+
   // set to true to indicate async loading in progress
   asyncLoading: boolean = false;
 
@@ -75,15 +78,21 @@ export class RequestResponseInfo {
     this.requestId = requestId;
   }
 
+  setStatus(status: number, statusText?: string) {
+    this.status = status;
+    this.statusText = statusText || getStatusText(this.status);
+  }
+
   fillFetchRequestPaused(params: Protocol.Fetch.RequestPausedEvent) {
     this.fillRequest(params.request, params.resourceType);
 
-    this.status = params.responseStatusCode || 0;
-    this.statusText = params.responseStatusText || getStatusText(this.status);
+    if (params.responseStatusCode) {
+      this.setStatus(params.responseStatusCode, params.responseStatusText);
+    }
 
     this.responseHeadersList = params.responseHeaders;
 
-    this.fetch = true;
+    this.intercepting = true;
 
     this.frameId = params.frameId;
   }
@@ -115,8 +124,7 @@ export class RequestResponseInfo {
 
     this.url = response.url.split("#")[0];
 
-    this.status = response.status;
-    this.statusText = response.statusText || getStatusText(this.status);
+    this.setStatus(response.status, response.statusText);
 
     this.protocol = response.protocol;
 
@@ -151,7 +159,7 @@ export class RequestResponseInfo {
   }
 
   isRedirectStatus() {
-    return this.status >= 300 && this.status < 400 && this.status !== 304;
+    return isRedirectStatus(this.status);
   }
 
   isSelfRedirect() {
@@ -181,8 +189,7 @@ export class RequestResponseInfo {
 
   fillFetchResponse(response: Response) {
     this.responseHeaders = Object.fromEntries(response.headers);
-    this.status = response.status;
-    this.statusText = response.statusText || getStatusText(this.status);
+    this.setStatus(response.status, response.statusText);
   }
 
   fillRequestExtraInfo(
@@ -239,7 +246,11 @@ export class RequestResponseInfo {
           headersDict[headerName] = "" + actualContentLength;
           continue;
         }
-        if (EXCLUDE_HEADERS.includes(headerName)) {
+        if (
+          EXCLUDE_HEADERS.includes(headerName) ||
+          (this.isRemoveRange &&
+            (headerName === CONTENT_RANGE || headerName === RANGE))
+        ) {
           headerName = "x-orig-" + headerName;
         }
         headersDict[headerName] = this._encodeHeaderValue(header.value);
@@ -262,7 +273,11 @@ export class RequestResponseInfo {
       }
       const value = this._encodeHeaderValue(headersDict[key]);
 
-      if (EXCLUDE_HEADERS.includes(keyLower)) {
+      if (
+        EXCLUDE_HEADERS.includes(keyLower) ||
+        (this.isRemoveRange &&
+          (keyLower === CONTENT_RANGE || keyLower === RANGE))
+      ) {
         headersDict["x-orig-" + key] = value;
         delete headersDict[key];
       } else {
@@ -315,14 +330,29 @@ export class RequestResponseInfo {
   }
 
   shouldSkipSave() {
-    // skip cached, OPTIONS/HEAD responses, and 304 or 206 responses
+    // skip cached, OPTIONS/HEAD responses, and 304 responses
     if (
       this.fromCache ||
-      !this.payload ||
       (this.method && ["OPTIONS", "HEAD"].includes(this.method)) ||
-      [206, 304].includes(this.status)
+      this.status == 304
     ) {
       return true;
+    }
+
+    // skip no payload response only if its not a redirect
+    if (!this.payload && !this.isRedirectStatus()) {
+      return true;
+    }
+
+    if (this.status === 206) {
+      const headers = new Headers(this.getResponseHeadersDict());
+      const contentLength: number = parseInt(
+        headers.get(CONTENT_LENGTH) || "0",
+      );
+      const contentRange = headers.get(CONTENT_RANGE);
+      if (contentRange !== `bytes 0-${contentLength - 1}/${contentLength}`) {
+        return false;
+      }
     }
 
     return false;
@@ -341,8 +371,11 @@ export class RequestResponseInfo {
     };
 
     if (postToGetUrl(convData)) {
-      //this.requestBody = convData.requestBody;
-      // truncate to avoid extra long URLs
+      // if not custom rewrite, truncate to avoid extra long URLs
+      if (getCustomRewriter(this.url, isHTMLMime(this.getMimeType() || ""))) {
+        return convData.url;
+      }
+
       try {
         const url = new URL(convData.url);
         for (const [key, value] of url.searchParams.entries()) {
@@ -371,17 +404,10 @@ export class RequestResponseInfo {
   }
 }
 
-export function isHTMLContentType(contentType: string | null) {
-  // just load if no content-type
-  if (!contentType) {
-    return true;
-  }
+export function isHTMLMime(mime: string) {
+  return HTML_TYPES.includes(mime);
+}
 
-  const mime = contentType.split(";")[0];
-
-  if (HTML_TYPES.includes(mime)) {
-    return true;
-  }
-
-  return false;
+export function isRedirectStatus(status: number) {
+  return status >= 300 && status < 400 && status !== 304;
 }
