@@ -39,15 +39,15 @@ import {
   runWorkers,
 } from "./util/worker.js";
 import { sleep, timedRun, secondsElapsed } from "./util/timing.js";
-import { collectAllFileSources, getInfoString } from "./util/file_reader.js";
+import { collectCustomBehaviors, getInfoString } from "./util/file_reader.js";
 
 import { Browser } from "./util/browser.js";
 
 import {
   ADD_LINK_FUNC,
   BEHAVIOR_LOG_FUNC,
-  DEFAULT_SELECTORS,
   DISPLAY,
+  ExtractSelector,
   PAGE_OP_TIMEOUT_SECS,
   SITEMAP_INITIAL_FETCH_TIMEOUT_SECS,
 } from "./util/constants.js";
@@ -175,6 +175,7 @@ export class Crawler {
   finalExit = false;
   uploadAndDeleteLocal = false;
   done = false;
+  postCrawling = false;
 
   textInPages = false;
 
@@ -190,12 +191,14 @@ export class Crawler {
 
   proxyServer?: string;
 
-  driver!: (opts: {
-    page: Page;
-    data: PageState;
-    // eslint-disable-next-line no-use-before-define
-    crawler: Crawler;
-  }) => Promise<void>;
+  driver:
+    | ((opts: {
+        page: Page;
+        data: PageState;
+        // eslint-disable-next-line no-use-before-define
+        crawler: Crawler;
+      }) => Promise<void>)
+    | null = null;
 
   recording: boolean;
 
@@ -490,6 +493,8 @@ export class Crawler {
 
     logger.info("Seeds", this.seeds);
 
+    logger.info("Link Selectors", this.params.selectLinks);
+
     if (this.params.behaviorOpts) {
       logger.info("Behavior Options", this.params.behaviorOpts);
     } else {
@@ -510,7 +515,7 @@ export class Crawler {
     }
 
     if (this.params.customBehaviors) {
-      this.customBehaviors = this.loadCustomBehaviors(
+      this.customBehaviors = await this.loadCustomBehaviors(
         this.params.customBehaviors,
       );
     }
@@ -800,10 +805,10 @@ self.__bx_behaviors.selectMainBehavior();
     });
   }
 
-  loadCustomBehaviors(filename: string) {
+  async loadCustomBehaviors(sources: string[]) {
     let str = "";
 
-    for (const { contents } of collectAllFileSources(filename, ".js")) {
+    for (const { contents } of await collectCustomBehaviors(sources)) {
       str += `self.__bx_behaviors.load(${contents});\n`;
     }
 
@@ -811,13 +816,13 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async checkBehaviorScripts(cdp: CDPSession) {
-    const filename = this.params.customBehaviors;
+    const sources = this.params.customBehaviors;
 
-    if (!filename) {
+    if (!sources) {
       return;
     }
 
-    for (const { path, contents } of collectAllFileSources(filename, ".js")) {
+    for (const { path, contents } of await collectCustomBehaviors(sources)) {
       await this.browser.checkScript(cdp, path, contents);
     }
   }
@@ -929,8 +934,12 @@ self.__bx_behaviors.selectMainBehavior();
       await page.setExtraHTTPHeaders({});
     }
 
-    // run custom driver here
-    await this.driver({ page, data, crawler: this });
+    // run custom driver here, if any
+    if (this.driver) {
+      await this.driver({ page, data, crawler: this });
+    } else {
+      await this.loadPage(page, data);
+    }
 
     data.title = await timedRun(
       page.title(),
@@ -1021,6 +1030,23 @@ self.__bx_behaviors.selectMainBehavior();
 
         if (textextract && this.params.text.includes("final-to-warc")) {
           await textextract.extractAndStoreText("textFinal", true, true);
+        }
+
+        if (
+          this.params.screenshot &&
+          this.screenshotWriter &&
+          this.params.screenshot.includes("fullPageFinal")
+        ) {
+          await page.evaluate(() => {
+            window.scrollTo(0, 0);
+          });
+          const screenshots = new Screenshots({
+            browser: this.browser,
+            page,
+            url,
+            writer: this.screenshotWriter,
+          });
+          await screenshots.takeFullPageFinal();
         }
       }
     }
@@ -1346,12 +1372,14 @@ self.__bx_behaviors.selectMainBehavior();
       );
     }
 
-    try {
-      const driverUrl = new URL(this.params.driver, import.meta.url);
-      this.driver = (await import(driverUrl.href)).default;
-    } catch (e) {
-      logger.warn(`Error importing driver ${this.params.driver}`, e);
-      return;
+    if (this.params.driver) {
+      try {
+        const driverUrl = new URL(this.params.driver, import.meta.url);
+        this.driver = (await import(driverUrl.href)).default;
+      } catch (e) {
+        logger.warn(`Error importing driver ${this.params.driver}`, e);
+        return;
+      }
     }
 
     await this.initCrawlState();
@@ -1536,11 +1564,12 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async postCrawl() {
+    this.postCrawling = true;
+    logger.info("Crawling done");
+
     if (this.params.combineWARC && !this.params.dryRun) {
       await this.combineWARC();
     }
-
-    logger.info("Crawling done");
 
     if (
       (this.params.generateCDX || this.params.generateWACZ) &&
@@ -1739,11 +1768,7 @@ self.__bx_behaviors.selectMainBehavior();
     }
   }
 
-  async loadPage(
-    page: Page,
-    data: PageState,
-    selectorOptsList = DEFAULT_SELECTORS,
-  ) {
+  async loadPage(page: Page, data: PageState) {
     const { url, depth } = data;
 
     const logDetails = data.logDetails;
@@ -1944,14 +1969,18 @@ self.__bx_behaviors.selectMainBehavior();
     await this.awaitPageLoad(page.mainFrame(), logDetails);
 
     // skip extraction if at max depth
-    if (seed.isAtMaxDepth(depth, extraHops) || !selectorOptsList) {
-      logger.debug("Skipping Link Extraction, At Max Depth");
+    if (seed.isAtMaxDepth(depth, extraHops)) {
+      logger.debug("Skipping Link Extraction, At Max Depth", {}, "links");
       return;
     }
 
-    logger.debug("Extracting links", logDetails);
+    logger.debug(
+      "Extracting links",
+      { selectors: this.params.selectLinks, ...logDetails },
+      "links",
+    );
 
-    await this.extractLinks(page, data, selectorOptsList, logDetails);
+    await this.extractLinks(page, data, this.params.selectLinks, logDetails);
   }
 
   async netIdle(page: Page, details: LogDetails) {
@@ -1997,7 +2026,7 @@ self.__bx_behaviors.selectMainBehavior();
   async extractLinks(
     page: Page,
     data: PageState,
-    selectors = DEFAULT_SELECTORS,
+    selectors: ExtractSelector[],
     logDetails: LogDetails,
   ) {
     const { seedId, depth, extraHops = 0, filteredFrames, callbacks } = data;
@@ -2043,11 +2072,7 @@ self.__bx_behaviors.selectMainBehavior();
     const frames = filteredFrames || page.frames();
 
     try {
-      for (const {
-        selector = "a[href]",
-        extract = "href",
-        isAttribute = false,
-      } of selectors) {
+      for (const { selector, extract, isAttribute } of selectors) {
         await Promise.allSettled(
           frames.map((frame) => {
             const getLinks = frame

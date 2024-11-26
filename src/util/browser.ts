@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import os from "os";
 import path from "path";
 
-import { LogContext, logger } from "./logger.js";
+import { formatErr, LogContext, logger } from "./logger.js";
 import { initStorage } from "./storage.js";
 
 import { DISPLAY, type ServiceWorkerOpt } from "./constants.js";
@@ -126,7 +126,7 @@ export class Browser {
         ? undefined
         : (target) => this.targetFilter(target),
     };
-    await this._init(launchOpts, ondisconnect, recording);
+    await this._init(launchOpts, ondisconnect);
   }
 
   targetFilter(target: Target) {
@@ -392,7 +392,6 @@ export class Browser {
     launchOpts: PuppeteerLaunchOptions,
     // eslint-disable-next-line @typescript-eslint/ban-types
     ondisconnect: Function | null = null,
-    recording: boolean,
   ) {
     this.browser = await puppeteer.launch(launchOpts);
 
@@ -400,9 +399,7 @@ export class Browser {
 
     this.firstCDP = await target.createCDPSession();
 
-    if (recording) {
-      await this.serviceWorkerFetch();
-    }
+    await this.browserContextFetch();
 
     if (ondisconnect) {
       this.browser.on("disconnected", (err) => ondisconnect(err));
@@ -410,6 +407,21 @@ export class Browser {
     this.browser.on("disconnected", () => {
       this.browser = null;
     });
+
+    // common permissions
+    const permissions = [
+      "notifications",
+      "geolocation",
+      "camera",
+      "microphone",
+    ];
+
+    for (const name of permissions) {
+      await this.firstCDP.send("Browser.setPermission", {
+        permission: { name },
+        setting: "granted",
+      });
+    }
   }
 
   async newWindowPageWithCDP(): Promise<{ cdp: CDPSession; page: Page }> {
@@ -479,35 +491,24 @@ export class Browser {
     return { page, cdp };
   }
 
-  async serviceWorkerFetch() {
+  async browserContextFetch() {
     if (!this.firstCDP) {
       return;
     }
 
     this.firstCDP.on("Fetch.requestPaused", async (params) => {
-      const { frameId, requestId, networkId, request } = params;
+      const { frameId, requestId, request } = params;
+
+      const { url } = request;
 
       if (!this.firstCDP) {
         throw new Error("CDP missing");
       }
 
-      if (networkId) {
-        try {
-          await this.firstCDP.send("Fetch.continueResponse", { requestId });
-        } catch (e) {
-          logger.warn(
-            "continueResponse failed",
-            { url: request.url },
-            "recorder",
-          );
-        }
-        return;
-      }
-
       let foundRecorder = null;
 
       for (const recorder of this.recorders) {
-        if (recorder.swUrls.has(request.url)) {
+        if (recorder.swUrls.has(url)) {
           recorder.swFrameIds.add(frameId);
         }
 
@@ -520,16 +521,16 @@ export class Browser {
       if (!foundRecorder) {
         logger.warn(
           "Skipping URL from unknown frame",
-          { url: request.url, frameId },
+          { url, frameId },
           "recorder",
         );
 
         try {
           await this.firstCDP.send("Fetch.continueResponse", { requestId });
         } catch (e) {
-          logger.warn(
+          logger.debug(
             "continueResponse failed",
-            { url: request.url },
+            { url, ...formatErr(e), from: "serviceWorker" },
             "recorder",
           );
         }
@@ -596,6 +597,7 @@ export const defaultArgs = [
   "--disable-prompt-on-repost",
   "--disable-renderer-backgrounding",
   "--disable-sync",
+  "--disable-lazy-loading",
   "--force-color-profile=srgb",
   "--metrics-recording-only",
   "--no-first-run",

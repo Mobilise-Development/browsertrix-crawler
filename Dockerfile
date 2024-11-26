@@ -1,4 +1,4 @@
-ARG BROWSER_VERSION=1.69.162
+ARG BROWSER_VERSION=1.73.91
 ARG BROWSER_IMAGE_BASE=webrecorder/browsertrix-browser-base:brave-${BROWSER_VERSION}
 
 FROM ${BROWSER_IMAGE_BASE}
@@ -39,7 +39,7 @@ ADD config/ /app/
 
 ADD html/ /app/html/
 
-ARG RWP_VERSION=2.1.4
+ARG RWP_VERSION=2.2.4
 ADD https://cdn.jsdelivr.net/npm/replaywebpage@${RWP_VERSION}/ui.js /app/html/rwp/
 ADD https://cdn.jsdelivr.net/npm/replaywebpage@${RWP_VERSION}/sw.js /app/html/rwp/
 ADD https://cdn.jsdelivr.net/npm/replaywebpage@${RWP_VERSION}/adblock/adblock.gz /app/html/rwp/adblock.gz
@@ -49,6 +49,8 @@ RUN chmod a+x /app/dist/main.js /app/dist/create-login-profile.js && chmod a+r /
 RUN ln -s /app/dist/main.js /usr/bin/crawl; \
     ln -s /app/dist/main.js /usr/bin/qa; \
     ln -s /app/dist/create-login-profile.js /usr/bin/create-login-profile
+
+RUN mkdir -p /app/behaviors
 
 WORKDIR /crawls
 
