@@ -7,19 +7,26 @@ import os from "os";
 import path from "path";
 
 import { formatErr, LogContext, logger } from "./logger.js";
+import { getSafeProxyString } from "./proxy.js";
 import { initStorage } from "./storage.js";
 
-import { DISPLAY, type ServiceWorkerOpt } from "./constants.js";
+import {
+  DISPLAY,
+  PAGE_OP_TIMEOUT_SECS,
+  type ServiceWorkerOpt,
+} from "./constants.js";
 
 import puppeteer, {
   Frame,
   HTTPRequest,
   Page,
-  PuppeteerLaunchOptions,
+  LaunchOptions,
   Viewport,
 } from "puppeteer-core";
 import { CDPSession, Target, Browser as PptrBrowser } from "puppeteer-core";
 import { Recorder } from "./recorder.js";
+import { timedRun } from "./timing.js";
+import assert from "node:assert";
 
 type BtrixChromeOpts = {
   proxy?: string;
@@ -35,6 +42,7 @@ type LaunchOpts = {
   // TODO: Fix this the next time the file is edited.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   emulateDevice?: Record<string, any>;
+
   ondisconnect?: ((err: unknown) => NonNullable<unknown>) | null;
 
   swOpt?: ServiceWorkerOpt;
@@ -61,8 +69,23 @@ export class Browser {
 
   swOpt?: ServiceWorkerOpt = "disabled";
 
+  crashed = false;
+
+  screenWidth: number;
+  screenHeight: number;
+  screenWHRatio: number;
+
   constructor() {
     this.profileDir = fs.mkdtempSync(path.join(os.tmpdir(), "profile-"));
+
+    // must be provided, part of Dockerfile
+    assert(process.env.GEOMETRY);
+
+    const geom = process.env.GEOMETRY.split("x");
+
+    this.screenWidth = Number(geom[0]);
+    this.screenHeight = Number(geom[1]);
+    this.screenWHRatio = this.screenWidth / this.screenHeight;
   }
 
   async launch({
@@ -97,18 +120,12 @@ export class Browser {
       args.push(`--display=${DISPLAY}`);
     }
 
-    let defaultViewport = null;
+    const defaultViewport = {
+      width: this.screenWidth,
+      height: this.screenHeight - (recording ? 0 : BROWSER_HEIGHT_OFFSET),
+    };
 
-    if (process.env.GEOMETRY) {
-      const geom = process.env.GEOMETRY.split("x");
-
-      defaultViewport = {
-        width: Number(geom[0]),
-        height: Number(geom[1]) - (recording ? 0 : BROWSER_HEIGHT_OFFSET),
-      };
-    }
-
-    const launchOpts: PuppeteerLaunchOptions = {
+    const launchOpts: LaunchOptions = {
       args,
       headless,
       executablePath: this.getBrowserExe(),
@@ -126,7 +143,7 @@ export class Browser {
         ? undefined
         : (target) => this.targetFilter(target),
     };
-    await this._init(launchOpts, ondisconnect);
+    await this._init(launchOpts, recording, ondisconnect);
   }
 
   targetFilter(target: Target) {
@@ -242,7 +259,8 @@ export class Browser {
     ];
 
     if (proxy) {
-      logger.info("Using proxy", { proxy }, "browser");
+      const proxyString = getSafeProxyString(proxy);
+      logger.info("Using proxy", { proxy: proxyString }, "browser");
     }
 
     if (proxy) {
@@ -301,7 +319,7 @@ export class Browser {
     let details: Record<string, any> = { frameUrl, ...logData };
 
     if (!frameUrl || frame.detached) {
-      logger.info(
+      logger.debug(
         "Run Script Skipped, frame no longer attached or has no URL",
         details,
         contextName,
@@ -323,7 +341,13 @@ export class Browser {
       return;
     }
 
-    logger.info("Run Script Started", details, contextName);
+    const isTopFrame = !frame.parentFrame();
+
+    if (isTopFrame) {
+      logger.debug("Run Script Started", details, contextName);
+    } else {
+      logger.debug("Run Script Started in iframe", details, contextName);
+    }
 
     // from puppeteer _evaluateInternal() but with includeCommandLineAPI: true
     //const contextId = context._contextId;
@@ -348,7 +372,11 @@ export class Browser {
       }
       logger.error("Run Script Failed", details, contextName);
     } else {
-      logger.info("Run Script Finished", details, contextName);
+      if (isTopFrame) {
+        logger.debug("Run Script Finished", details, contextName);
+      } else {
+        logger.debug("Run Script Finished in iframe", details, contextName);
+      }
     }
 
     return result.value;
@@ -364,10 +392,37 @@ export class Browser {
   }
 
   async close() {
-    if (this.browser) {
+    if (!this.browser) {
+      return;
+    }
+
+    if (!this.crashed) {
       this.browser.removeAllListeners("disconnected");
-      await this.browser.close();
+      try {
+        await timedRun(
+          this.browser.close(),
+          PAGE_OP_TIMEOUT_SECS,
+          "Closing Browser Timed Out",
+          {},
+          "browser",
+          true,
+        );
+      } catch (e) {
+        // ignore
+      }
       this.browser = null;
+    }
+  }
+
+  killBrowser() {
+    // used when main browser process appears to be stalled
+    // puppeteer should still be able to continue, from initial testing
+    // and avoids interrupting crawler when not auto-restarting
+    if (this.browser) {
+      const proc = this.browser.process();
+      if (proc) {
+        proc.kill();
+      }
     }
   }
 
@@ -388,8 +443,9 @@ export class Browser {
     }
   }
 
-  async _init(
-    launchOpts: PuppeteerLaunchOptions,
+  private async _init(
+    launchOpts: LaunchOptions,
+    recording: boolean,
     // eslint-disable-next-line @typescript-eslint/ban-types
     ondisconnect: Function | null = null,
   ) {
@@ -399,7 +455,9 @@ export class Browser {
 
     this.firstCDP = await target.createCDPSession();
 
-    await this.browserContextFetch();
+    if (recording) {
+      await this.browserContextFetch();
+    }
 
     if (ondisconnect) {
       this.browser.on("disconnected", (err) => ondisconnect(err));

@@ -27,29 +27,26 @@ import {
   interpolateFilename,
   checkDiskUtilization,
   S3StorageSync,
+  isDiskFull,
 } from "./util/storage.js";
 import { ScreenCaster, WSTransport } from "./util/screencaster.js";
 import { Screenshots } from "./util/screenshots.js";
 import { initRedis } from "./util/redis.js";
-import { logger, formatErr, LogDetails } from "./util/logger.js";
-import {
-  WorkerOpts,
-  WorkerState,
-  closeWorkers,
-  runWorkers,
-} from "./util/worker.js";
+import { logger, formatErr, LogDetails, LogContext } from "./util/logger.js";
+import { WorkerState, closeWorkers, runWorkers } from "./util/worker.js";
 import { sleep, timedRun, secondsElapsed } from "./util/timing.js";
 import { collectCustomBehaviors, getInfoString } from "./util/file_reader.js";
 
 import { Browser } from "./util/browser.js";
 
 import {
-  ADD_LINK_FUNC,
-  BEHAVIOR_LOG_FUNC,
   DISPLAY,
   ExtractSelector,
   PAGE_OP_TIMEOUT_SECS,
   SITEMAP_INITIAL_FETCH_TIMEOUT_SECS,
+  ExitCodes,
+  InterruptReason,
+  BxFunctionBindings,
 } from "./util/constants.js";
 
 import { AdBlockRules, BlockRuleDecl, BlockRules } from "./util/blockrules.js";
@@ -74,8 +71,9 @@ import {
 } from "./util/warcwriter.js";
 import { isHTMLMime, isRedirectStatus } from "./util/reqresp.js";
 import { initProxy } from "./util/proxy.js";
+import { initFlow, nextFlowStep } from "./util/flowbehavior.js";
 
-const behaviors = fs.readFileSync(
+const btrixBehaviors = fs.readFileSync(
   new URL(
     "../node_modules/browsertrix-behaviors/dist/behaviors.js",
     import.meta.url,
@@ -170,8 +168,7 @@ export class Crawler {
 
   skipTextDocs = 0;
 
-  interrupted = false;
-  browserCrashed = false;
+  interruptReason: InterruptReason | null = null;
   finalExit = false;
   uploadAndDeleteLocal = false;
   done = false;
@@ -195,6 +192,7 @@ export class Crawler {
     | ((opts: {
         page: Page;
         data: PageState;
+        seed: ScopedSeed;
         // eslint-disable-next-line no-use-before-define
         crawler: Crawler;
       }) => Promise<void>)
@@ -207,6 +205,8 @@ export class Crawler {
     this.params = args as CrawlerArgs;
     this.origConfig = this.params.origConfig;
 
+    this.crawlId = this.params.crawlId;
+
     // root collections dir
     this.collDir = path.join(
       this.params.cwd,
@@ -216,7 +216,7 @@ export class Crawler {
     this.logDir = path.join(this.collDir, "logs");
     this.logFilename = path.join(
       this.logDir,
-      `crawl-${new Date().toISOString().replace(/[^\d]/g, "")}.log`,
+      `${interpolateFilename("@ts", "")}.log`,
     );
 
     const debugLogging = this.params.logging.includes("debug");
@@ -224,13 +224,6 @@ export class Crawler {
     logger.setLogLevel(this.params.logLevel);
     logger.setContext(this.params.logContext);
     logger.setExcludeContext(this.params.logExcludeContext);
-
-    // if automatically restarts on error exit code,
-    // exit with 0 from fatal by default, to avoid unnecessary restart
-    // otherwise, exit with default fatal exit code
-    if (this.params.restartsOnError) {
-      logger.setDefaultFatalExitCode(0);
-    }
 
     logger.debug("Writing log to: " + this.logFilename, {}, "general");
 
@@ -245,8 +238,6 @@ export class Crawler {
 
     // pages file
     this.pagesFH = null;
-
-    this.crawlId = process.env.CRAWL_ID || os.hostname();
 
     this.startTime = Date.now();
 
@@ -308,7 +299,7 @@ export class Crawler {
 
     this.healthChecker = null;
 
-    this.interrupted = false;
+    this.interruptReason = null;
     this.finalExit = false;
     this.uploadAndDeleteLocal = false;
 
@@ -377,11 +368,35 @@ export class Crawler {
 
     this.crawlState = new RedisCrawlState(
       redis,
-      this.params.crawlId,
+      this.crawlId,
       this.maxPageTime,
       os.hostname(),
+      this.params.maxPageRetries,
     );
 
+    if (this.params.logErrorsToRedis) {
+      logger.setLogErrorsToRedis(true);
+    }
+
+    if (this.params.logBehaviorsToRedis) {
+      logger.setLogBehaviorsToRedis(true);
+    }
+
+    if (this.params.logErrorsToRedis || this.params.logBehaviorsToRedis) {
+      logger.setCrawlState(this.crawlState);
+    }
+
+    // if automatically restarts on error exit code,
+    // exit with 0 from fatal by default, to avoid unnecessary restart
+    // otherwise, exit with default fatal exit code
+    if (this.params.restartsOnError) {
+      logger.setDefaultFatalExitCode(0);
+    }
+
+    return this.crawlState;
+  }
+
+  async loadCrawlState() {
     // load full state from config
     if (this.params.state) {
       await this.crawlState.load(this.params.state, this.seeds, true);
@@ -400,13 +415,6 @@ export class Crawler {
         "state",
       );
     }
-
-    if (this.params.logErrorsToRedis) {
-      logger.setLogErrorsToRedis(true);
-      logger.setCrawlState(this.crawlState);
-    }
-
-    return this.crawlState;
   }
 
   async loadExtraSeeds() {
@@ -438,7 +446,11 @@ export class Crawler {
       return null;
     }
 
-    return new ScreenCaster(transport, this.params.workers);
+    return new ScreenCaster(
+      transport,
+      this.params.workers,
+      this.browser.screenWHRatio,
+    );
   }
 
   launchRedis() {
@@ -464,6 +476,15 @@ export class Crawler {
   }
 
   async bootstrap() {
+    if (await isDiskFull(this.params.cwd)) {
+      logger.fatal(
+        "Out of disk space, exiting",
+        {},
+        "general",
+        ExitCodes.OutOfSpace,
+      );
+    }
+
     const subprocesses: ChildProcess[] = [];
 
     const redisUrl = this.params.redisStoreUrl || "redis://localhost:6379/0";
@@ -474,6 +495,8 @@ export class Crawler {
     ) {
       subprocesses.push(this.launchRedis());
     }
+
+    await this.initCrawlState();
 
     await fsp.mkdir(this.logDir, { recursive: true });
 
@@ -560,6 +583,8 @@ export class Crawler {
     if (this.params.text && !this.params.dryRun) {
       this.textWriter = this.createExtraResourceWarcWriter("text");
     }
+
+    await this.loadCrawlState();
   }
 
   extraChromeArgs() {
@@ -574,7 +599,7 @@ export class Crawler {
     await this.bootstrap();
 
     let status = "done";
-    let exitCode = 0;
+    let exitCode = ExitCodes.Success;
 
     try {
       await this.crawl();
@@ -587,14 +612,33 @@ export class Crawler {
         } else if (stopped) {
           status = "done";
           logger.info("Crawl gracefully stopped on request");
-        } else if (this.interrupted) {
+        } else if (this.interruptReason) {
           status = "interrupted";
-          exitCode = this.browserCrashed ? 10 : 11;
+          switch (this.interruptReason) {
+            case InterruptReason.SizeLimit:
+              exitCode = ExitCodes.SizeLimit;
+              break;
+            case InterruptReason.BrowserCrashed:
+              exitCode = ExitCodes.BrowserCrashed;
+              break;
+            case InterruptReason.SignalInterrupted:
+              exitCode = ExitCodes.SignalInterrupted;
+              break;
+            case InterruptReason.DiskUtilization:
+              exitCode = ExitCodes.DiskUtilization;
+              break;
+            case InterruptReason.FailedLimit:
+              exitCode = ExitCodes.FailedLimit;
+              break;
+            case InterruptReason.TimeLimit:
+              exitCode = ExitCodes.TimeLimit;
+              break;
+          }
         }
       }
     } catch (e) {
       logger.error("Crawl failed", e);
-      exitCode = 9;
+      exitCode = ExitCodes.Failed;
       status = "failing";
       if (await this.crawlState.incFailCount()) {
         status = "failed";
@@ -615,33 +659,58 @@ export class Crawler {
 
     const logDetails = { page: pageUrl, workerid };
 
+    let context: LogContext = "behaviorScript";
+
     if (typeof data === "string") {
       message = data;
       details = logDetails;
     } else {
-      message = type === "info" ? "Behavior log" : "Behavior debug";
+      switch (type) {
+        case "error":
+          message = "Behavior error";
+          break;
+        case "debug":
+          message = "Behavior debug";
+          break;
+        default:
+          message = "Behavior log";
+      }
       details =
         typeof data === "object"
           ? { ...(data as object), ...logDetails }
           : logDetails;
+
+      if (typeof data === "object") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const objData = data as any;
+        if (objData.siteSpecific) {
+          context = "behaviorScriptCustom";
+          delete objData.siteSpecific;
+        }
+        message = objData.msg || message;
+        delete objData.msg;
+        details = { ...objData, ...logDetails };
+      } else {
+        details = logDetails;
+      }
     }
 
     switch (type) {
       case "info":
         behaviorLine = JSON.stringify(data);
         if (behaviorLine !== this.behaviorLastLine) {
-          logger.info(message, details, "behaviorScript");
+          logger.info(message, details, context);
           this.behaviorLastLine = behaviorLine;
         }
         break;
 
       case "error":
-        logger.error(message, details, "behaviorScript");
+        logger.error(message, details, context);
         break;
 
       case "debug":
       default:
-        logger.debug(message, details, "behaviorScript");
+        logger.debug(message, details, context);
     }
   }
 
@@ -688,13 +757,9 @@ export class Crawler {
     return !!seed.isIncluded(url, depth, extraHops, logDetails);
   }
 
-  async setupPage({
-    page,
-    cdp,
-    workerid,
-    callbacks,
-    frameIdToExecId,
-  }: WorkerOpts) {
+  async setupPage(opts: WorkerState) {
+    const { page, cdp, workerid, callbacks, frameIdToExecId, recorder } = opts;
+
     await this.browser.setupPage({ page, cdp });
 
     await this.setupExecContextEvents(cdp, frameIdToExecId);
@@ -745,17 +810,19 @@ export class Crawler {
     }
 
     await page.exposeFunction(
-      ADD_LINK_FUNC,
+      BxFunctionBindings.AddLinkFunc,
       (url: string) => callbacks.addLink && callbacks.addLink(url),
     );
 
+    // used for both behaviors and link extraction now
+    await this.browser.addInitScript(page, btrixBehaviors);
+
     if (this.params.behaviorOpts) {
       await page.exposeFunction(
-        BEHAVIOR_LOG_FUNC,
+        BxFunctionBindings.BehaviorLogFunc,
         (logdata: { data: string; type: string }) =>
           this._behaviorLog(logdata, page.url(), workerid),
       );
-      await this.browser.addInitScript(page, behaviors);
 
       const initScript = `
 self.__bx_behaviors.init(${this.params.behaviorOpts}, false);
@@ -767,8 +834,102 @@ self.__bx_behaviors.selectMainBehavior();
         this.behaviorsChecked = true;
       }
 
+      await page.exposeFunction(BxFunctionBindings.FetchFunc, (url: string) => {
+        return recorder ? recorder.addExternalFetch(url, cdp) : false;
+      });
+
       await this.browser.addInitScript(page, initScript);
     }
+
+    // only add if running with autoclick behavior
+    if (this.params.behaviors.includes("autoclick")) {
+      // Ensure off-page navigation is canceled while behavior is running
+      page.on("dialog", async (dialog) => {
+        let accepted = true;
+        if (dialog.type() === "beforeunload") {
+          if (opts.pageBlockUnload) {
+            accepted = false;
+            await dialog.dismiss();
+          } else {
+            await dialog.accept();
+          }
+        } else {
+          await dialog.accept();
+        }
+        logger.debug("JS Dialog", {
+          accepted,
+          blockingUnload: opts.pageBlockUnload,
+          message: dialog.message(),
+          type: dialog.type(),
+          page: page.url(),
+          workerid,
+        });
+      });
+
+      // Close any windows opened during navigation from autoclick
+      await cdp.send("Target.setDiscoverTargets", { discover: true });
+
+      cdp.on("Target.targetCreated", async (params) => {
+        const { targetInfo } = params;
+        const { type, openerFrameId, targetId } = targetInfo;
+
+        try {
+          if (
+            type === "page" &&
+            openerFrameId &&
+            opts.frameIdToExecId.has(openerFrameId)
+          ) {
+            await cdp.send("Target.closeTarget", { targetId });
+          } else {
+            logger.warn("Extra target not closed", { targetInfo });
+          }
+
+          await cdp.send("Runtime.runIfWaitingForDebugger");
+        } catch (e) {
+          // target likely already closed
+        }
+      });
+
+      void cdp.send("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: false,
+      });
+
+      if (this.recording) {
+        await cdp.send("Page.enable");
+
+        cdp.on("Page.windowOpen", async (params) => {
+          const { seedId, depth, extraHops = 0, url } = opts.data;
+
+          const logDetails = { page: url, workerid };
+
+          await this.queueInScopeUrls(
+            seedId,
+            [params.url],
+            depth,
+            extraHops,
+            false,
+            logDetails,
+          );
+        });
+      }
+    }
+
+    await page.exposeFunction(BxFunctionBindings.AddToSeenSet, (data: string) =>
+      this.crawlState.addToUserSet(data),
+    );
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await page.exposeFunction(BxFunctionBindings.InitFlow, (params: any) => {
+      return initFlow(params, recorder, cdp, this.crawlState, workerid);
+    });
+
+    await page.exposeFunction(BxFunctionBindings.NextFlowStep, (id: string) => {
+      return nextFlowStep(id, page, workerid);
+    });
+
+    // await page.exposeFunction("__bx_hasSet", (data: string) => this.crawlState.hasUserSet(data));
   }
 
   async setupExecContextEvents(
@@ -852,7 +1013,7 @@ self.__bx_behaviors.selectMainBehavior();
   async crawlPage(opts: WorkerState): Promise<void> {
     await this.writeStats();
 
-    const { page, cdp, data, workerid, callbacks, directFetchCapture } = opts;
+    const { page, cdp, data, workerid, callbacks, recorder } = opts;
     data.callbacks = callbacks;
 
     const { url, seedId } = data;
@@ -870,14 +1031,14 @@ self.__bx_behaviors.selectMainBehavior();
     data.logDetails = logDetails;
     data.workerid = workerid;
 
-    if (directFetchCapture) {
+    if (recorder) {
       try {
         const headers = auth
           ? { Authorization: auth, ...this.headers }
           : this.headers;
 
         const result = await timedRun(
-          directFetchCapture({ url, headers, cdp }),
+          recorder.directFetchCapture({ url, headers, cdp }),
           this.params.pageLoadTimeout,
           "Direct fetch of page URL timed out",
           logDetails,
@@ -926,6 +1087,7 @@ self.__bx_behaviors.selectMainBehavior();
     }
 
     opts.markPageUsed();
+    opts.pageBlockUnload = false;
 
     if (auth) {
       await page.setExtraHTTPHeaders({ Authorization: auth });
@@ -934,11 +1096,21 @@ self.__bx_behaviors.selectMainBehavior();
       await page.setExtraHTTPHeaders({});
     }
 
+    const seed = await this.crawlState.getSeedAt(
+      this.seeds,
+      this.numOriginalSeeds,
+      seedId,
+    );
+
+    if (recorder) {
+      recorder.pageSeed = seed;
+    }
+
     // run custom driver here, if any
     if (this.driver) {
-      await this.driver({ page, data, crawler: this });
+      await this.driver({ page, data, crawler: this, seed });
     } else {
-      await this.loadPage(page, data);
+      await this.loadPage(page, data, seed);
     }
 
     data.title = await timedRun(
@@ -949,7 +1121,11 @@ self.__bx_behaviors.selectMainBehavior();
     );
     data.favicon = await this.getFavicon(page, logDetails);
 
+    opts.pageBlockUnload = true;
+
     await this.doPostLoadActions(opts);
+
+    opts.pageBlockUnload = false;
 
     await this.awaitPageExtraDelay(opts);
   }
@@ -1005,7 +1181,7 @@ self.__bx_behaviors.selectMainBehavior();
 
     if (this.params.behaviorOpts && data.status < 400) {
       if (data.skipBehaviors) {
-        logger.info("Skipping behaviors for slow page", logDetails, "behavior");
+        logger.warn("Skipping behaviors for slow page", logDetails, "behavior");
       } else {
         const res = await timedRun(
           this.runBehaviors(
@@ -1037,9 +1213,15 @@ self.__bx_behaviors.selectMainBehavior();
           this.screenshotWriter &&
           this.params.screenshot.includes("fullPageFinal")
         ) {
-          await page.evaluate(() => {
-            window.scrollTo(0, 0);
-          });
+          await timedRun(
+            page.evaluate(() => {
+              window.scrollTo(0, 0);
+            }),
+            PAGE_OP_TIMEOUT_SECS,
+            "Page scroll timed out",
+            logDetails,
+          );
+
           const screenshots = new Screenshots({
             browser: this.browser,
             page,
@@ -1070,13 +1252,13 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async pageFinished(data: PageState) {
-    await this.writePage(data);
-
     // if page loaded, considered page finished successfully
     // (even if behaviors timed out)
-    const { loadState, logDetails, depth, url } = data;
+    const { loadState, logDetails, depth, url, pageSkipped } = data;
 
     if (data.loadState >= LoadState.FULL_PAGE_LOADED) {
+      await this.writePage(data);
+
       logger.info("Page Finished", { loadState, ...logDetails }, "pageStatus");
 
       await this.crawlState.markFinished(url);
@@ -1089,23 +1271,36 @@ self.__bx_behaviors.selectMainBehavior();
 
       await this.checkLimits();
     } else {
-      await this.crawlState.markFailed(url);
+      if (pageSkipped) {
+        await this.crawlState.markExcluded(url);
+      } else {
+        const retry = await this.crawlState.markFailed(url);
 
-      if (this.healthChecker) {
-        this.healthChecker.incError();
-      }
+        if (this.healthChecker) {
+          this.healthChecker.incError();
+        }
 
-      await this.serializeConfig();
+        if (retry < 0) {
+          await this.writePage(data);
 
-      if (depth === 0 && this.params.failOnFailedSeed) {
-        logger.fatal("Seed Page Load Failed, failing crawl", {}, "general", 1);
+          await this.serializeConfig();
+
+          if (depth === 0 && this.params.failOnFailedSeed) {
+            logger.fatal(
+              "Seed Page Load Failed, failing crawl",
+              {},
+              "general",
+              1,
+            );
+          }
+        }
       }
 
       await this.checkLimits();
     }
   }
 
-  async teardownPage({ workerid }: WorkerOpts) {
+  async teardownPage({ workerid }: WorkerState) {
     if (this.screencaster) {
       await this.screencaster.stopById(workerid);
     }
@@ -1128,7 +1323,7 @@ self.__bx_behaviors.selectMainBehavior();
     try {
       frames = frames || page.frames();
 
-      logger.info(
+      logger.debug(
         "Running behaviors",
         {
           frames: frames.length,
@@ -1167,7 +1362,7 @@ self.__bx_behaviors.selectMainBehavior();
         }
       }
 
-      logger.info(
+      logger.debug(
         "Behaviors finished",
         { finished: results.length, ...logDetails },
         "behavior",
@@ -1252,7 +1447,7 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async checkLimits() {
-    let interrupt = false;
+    let interrupt: InterruptReason | null = null;
 
     const size = await this.updateCurrSize();
 
@@ -1261,7 +1456,7 @@ self.__bx_behaviors.selectMainBehavior();
         logger.info(
           `Size threshold reached ${size} >= ${this.params.sizeLimit}, stopping`,
         );
-        interrupt = true;
+        interrupt = InterruptReason.SizeLimit;
       }
     }
 
@@ -1271,7 +1466,7 @@ self.__bx_behaviors.selectMainBehavior();
         logger.info(
           `Time threshold reached ${elapsed} > ${this.params.timeLimit}, stopping`,
         );
-        interrupt = true;
+        interrupt = InterruptReason.TimeLimit;
       }
     }
 
@@ -1283,7 +1478,7 @@ self.__bx_behaviors.selectMainBehavior();
         size,
       );
       if (diskUtil.stop === true) {
-        interrupt = true;
+        interrupt = InterruptReason.DiskUtilization;
       }
     }
 
@@ -1293,18 +1488,21 @@ self.__bx_behaviors.selectMainBehavior();
       if (numFailed >= failedLimit) {
         logger.fatal(
           `Failed threshold reached ${numFailed} >= ${failedLimit}, failing crawl`,
+          {},
+          "general",
+          ExitCodes.FailedLimit,
         );
       }
     }
 
     if (interrupt) {
       this.uploadAndDeleteLocal = true;
-      this.gracefulFinishOnInterrupt();
+      this.gracefulFinishOnInterrupt(interrupt);
     }
   }
 
-  gracefulFinishOnInterrupt() {
-    this.interrupted = true;
+  gracefulFinishOnInterrupt(interruptReason: InterruptReason) {
+    this.interruptReason = interruptReason;
     logger.info("Crawler interrupted, gracefully finishing current pages");
     if (!this.params.waitOnDone && !this.params.restartsOnError) {
       this.finalExit = true;
@@ -1313,11 +1511,11 @@ self.__bx_behaviors.selectMainBehavior();
 
   async checkCanceled() {
     if (this.crawlState && (await this.crawlState.isCrawlCanceled())) {
-      await this.setStatusAndExit(0, "canceled");
+      await this.setStatusAndExit(ExitCodes.Success, "canceled");
     }
   }
 
-  async setStatusAndExit(exitCode: number, status: string) {
+  async setStatusAndExit(exitCode: ExitCodes, status: string) {
     logger.info(`Exiting, Crawl status: ${status}`);
 
     await this.closeLog();
@@ -1331,25 +1529,30 @@ self.__bx_behaviors.selectMainBehavior();
   async serializeAndExit() {
     await this.serializeConfig();
 
-    if (this.interrupted) {
-      await this.browser.close();
+    if (this.interruptReason) {
       await closeWorkers(0);
+      await this.browser.close();
       await this.closeFiles();
+
       if (!this.done) {
-        await this.setStatusAndExit(13, "interrupted");
+        await this.setStatusAndExit(
+          ExitCodes.SignalInterruptedForce,
+          "interrupted",
+        );
         return;
       }
     }
-    await this.setStatusAndExit(0, "done");
+
+    await this.setStatusAndExit(ExitCodes.Success, "done");
   }
 
   async isCrawlRunning() {
-    if (this.interrupted) {
+    if (this.interruptReason) {
       return false;
     }
 
     if (await this.crawlState.isCrawlCanceled()) {
-      await this.setStatusAndExit(0, "canceled");
+      await this.setStatusAndExit(ExitCodes.Success, "canceled");
       return false;
     }
 
@@ -1366,6 +1569,7 @@ self.__bx_behaviors.selectMainBehavior();
       this.healthChecker = new HealthChecker(
         this.params.healthCheckPort,
         this.params.workers,
+        this.browser,
         async () => {
           await this.updateCurrSize();
         },
@@ -1381,8 +1585,6 @@ self.__bx_behaviors.selectMainBehavior();
         return;
       }
     }
-
-    await this.initCrawlState();
 
     let initState = await this.crawlState.getStatus();
 
@@ -1410,12 +1612,17 @@ self.__bx_behaviors.selectMainBehavior();
 
     if (this.params.generateWACZ) {
       this.storage = initStorage();
+
+      if (this.storage) {
+        await this.crawlState.setWACZFilename();
+      }
     }
 
     if (POST_CRAWL_STATES.includes(initState)) {
       logger.info("crawl already finished, running post-crawl tasks", {
         state: initState,
       });
+      this.finalExit = true;
       await this.postCrawl();
       return;
     } else if (await this.crawlState.isCrawlStopped()) {
@@ -1473,13 +1680,12 @@ self.__bx_behaviors.selectMainBehavior();
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ondisconnect: (err: any) => {
-        this.interrupted = true;
+        this.markBrowserCrashed();
         logger.error(
           "Browser disconnected (crashed?), interrupting crawl",
           err,
           "browser",
         );
-        this.browserCrashed = true;
       },
 
       recording: this.recording,
@@ -1499,8 +1705,11 @@ self.__bx_behaviors.selectMainBehavior();
 
     await this.writeStats();
 
-    // if crawl has been stopped, mark as final exit for post-crawl tasks
-    if (await this.crawlState.isCrawlStopped()) {
+    // if crawl has been stopped or finished, mark as final exit for post-crawl tasks
+    if (
+      (await this.crawlState.isCrawlStopped()) ||
+      (await this.crawlState.isFinished())
+    ) {
       this.finalExit = true;
     }
 
@@ -1571,9 +1780,13 @@ self.__bx_behaviors.selectMainBehavior();
       await this.combineWARC();
     }
 
+    const generateFiles =
+      !this.params.dryRun &&
+      (!this.interruptReason || this.finalExit || this.uploadAndDeleteLocal);
+
     if (
       (this.params.generateCDX || this.params.generateWACZ) &&
-      !this.params.dryRun
+      generateFiles
     ) {
       logger.info("Merging CDX");
       await this.crawlState.setStatus(
@@ -1587,11 +1800,7 @@ self.__bx_behaviors.selectMainBehavior();
       );
     }
 
-    if (
-      this.params.generateWACZ &&
-      !this.params.dryRun &&
-      (!this.interrupted || this.finalExit || this.uploadAndDeleteLocal)
-    ) {
+    if (this.params.generateWACZ && generateFiles) {
       const uploaded = await this.generateWACZ();
 
       if (uploaded && this.uploadAndDeleteLocal) {
@@ -1606,7 +1815,7 @@ self.__bx_behaviors.selectMainBehavior();
       }
     }
 
-    if (this.params.waitOnDone && (!this.interrupted || this.finalExit)) {
+    if (this.params.waitOnDone && (!this.interruptReason || this.finalExit)) {
       this.done = true;
       logger.info("All done, waiting for signal...");
       await this.crawlState.setStatus("done");
@@ -1614,6 +1823,11 @@ self.__bx_behaviors.selectMainBehavior();
       // wait forever until signal
       await new Promise(() => {});
     }
+  }
+
+  markBrowserCrashed() {
+    this.interruptReason = InterruptReason.BrowserCrashed;
+    this.browser.crashed = true;
   }
 
   async closeLog(): Promise<void> {
@@ -1701,10 +1915,13 @@ self.__bx_behaviors.selectMainBehavior();
 
       if (this.storage) {
         await this.crawlState.setStatus("uploading-wacz");
-        const filename = process.env.STORE_FILENAME || "@ts-@id.wacz";
-        const targetFilename = interpolateFilename(filename, this.crawlId);
+
+        const targetFilename = await this.crawlState.getWACZFilename();
 
         await this.storage.uploadCollWACZ(wacz, targetFilename, isFinished);
+
+        await this.crawlState.clearWACZFilename();
+
         return true;
       }
 
@@ -1740,16 +1957,17 @@ self.__bx_behaviors.selectMainBehavior();
 
     const realSize = await this.crawlState.queueSize();
     const pendingPages = await this.crawlState.getPendingList();
-    const done = await this.crawlState.numDone();
+    const pending = pendingPages.length;
+    const crawled = await this.crawlState.numDone();
     const failed = await this.crawlState.numFailed();
-    const total = realSize + pendingPages.length + done;
+    const total = realSize + pendingPages.length + crawled + failed;
     const limit = { max: this.pageLimit || 0, hit: this.limitHit };
     const stats = {
-      crawled: done,
-      total: total,
-      pending: pendingPages.length,
-      failed: failed,
-      limit: limit,
+      crawled,
+      total,
+      pending,
+      failed,
+      limit,
       pendingPages,
     };
 
@@ -1768,8 +1986,26 @@ self.__bx_behaviors.selectMainBehavior();
     }
   }
 
-  async loadPage(page: Page, data: PageState) {
-    const { url, depth } = data;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  pageFailed(msg: string, retry: number, msgData: any) {
+    if (retry < this.params.maxPageRetries) {
+      logger.warn(
+        msg + ": will retry",
+        { retry, retries: this.params.maxPageRetries, ...msgData },
+        "pageStatus",
+      );
+    } else {
+      logger.error(
+        msg + ": retry limit reached",
+        { retry, retries: this.params.maxPageRetries, ...msgData },
+        "pageStatus",
+      );
+    }
+    throw new Error("logged");
+  }
+
+  async loadPage(page: Page, data: PageState, seed: ScopedSeed) {
+    const { url, depth, retry } = data;
 
     const logDetails = data.logDetails;
 
@@ -1796,19 +2032,21 @@ self.__bx_behaviors.selectMainBehavior();
 
     // store the first successful non-redirect response, even if page doesn't load fully
     const waitFirstResponse = (resp: HTTPResponse) => {
-      firstResponse = resp;
-      if (!isRedirectStatus(firstResponse.status())) {
+      if (!isRedirectStatus(resp.status())) {
+        firstResponse = resp;
         // don't listen to any additional responses
         page.off("response", waitFirstResponse);
       }
     };
 
-    page.on("response", waitFirstResponse);
+    const handleFirstLoadEvents = () => {
+      page.on("response", waitFirstResponse);
 
-    // store that domcontentloaded was finished
-    page.once("domcontentloaded", () => {
-      data.loadState = LoadState.CONTENT_LOADED;
-    });
+      // store that domcontentloaded was finished
+      page.once("domcontentloaded", () => {
+        data.loadState = LoadState.CONTENT_LOADED;
+      });
+    };
 
     const gotoOpts = data.isHTMLPage
       ? this.gotoOpts
@@ -1816,9 +2054,24 @@ self.__bx_behaviors.selectMainBehavior();
 
     logger.info("Awaiting page load", logDetails);
 
+    const urlNoHash = url.split("#")[0];
+
+    const fullRefresh = urlNoHash === page.url().split("#")[0];
+
     try {
+      if (!fullRefresh) {
+        handleFirstLoadEvents();
+      }
       // store the page load response when page fully loads
       fullLoadedResponse = await page.goto(url, gotoOpts);
+
+      if (fullRefresh) {
+        logger.debug("Hashtag-only change, doing full page reload");
+
+        handleFirstLoadEvents();
+
+        fullLoadedResponse = await page.reload(gotoOpts);
+      }
     } catch (e) {
       if (!(e instanceof Error)) {
         throw e;
@@ -1839,27 +2092,43 @@ self.__bx_behaviors.selectMainBehavior();
       } else if (!downloadResponse) {
         // log if not already log and rethrow, consider page failed
         if (msg !== "logged") {
-          logger.error("Page Load Failed, skipping page", {
-            msg,
-            loadState: data.loadState,
-            ...logDetails,
-          });
-          e.message = "logged";
+          const loadState = data.loadState;
+
+          // excluded in recorder
+          if (msg.startsWith("net::ERR_BLOCKED_BY_RESPONSE")) {
+            data.pageSkipped = true;
+            logger.warn("Page Load Blocked, skipping", { msg, loadState });
+          } else {
+            return this.pageFailed("Page Load Failed", retry, {
+              msg,
+              url,
+              loadState,
+              ...logDetails,
+            });
+          }
         }
-        throw e;
       }
     }
 
     const resp = fullLoadedResponse || downloadResponse || firstResponse;
 
     if (!resp) {
-      throw new Error("no response for page load, assuming failed");
+      return this.pageFailed("Page Load Failed, no response", retry, {
+        url,
+        ...logDetails,
+      });
     }
 
-    const respUrl = resp.url();
+    const respUrl = resp.url().split("#")[0];
     const isChromeError = page.url().startsWith("chrome-error://");
 
-    if (depth === 0 && !isChromeError && respUrl !== url && !downloadResponse) {
+    if (
+      depth === 0 &&
+      !isChromeError &&
+      respUrl !== urlNoHash &&
+      respUrl + "/" !== url &&
+      !downloadResponse
+    ) {
       data.seedId = await this.crawlState.addExtraSeed(
         this.seeds,
         this.numOriginalSeeds,
@@ -1884,14 +2153,11 @@ self.__bx_behaviors.selectMainBehavior();
     }
 
     if (failed) {
-      logger.error(
+      return this.pageFailed(
         isChromeError ? "Page Crashed on Load" : "Page Invalid Status",
-        {
-          status,
-          ...logDetails,
-        },
+        retry,
+        { url, status, ...logDetails },
       );
-      throw new Error("logged");
     }
 
     const contentType = resp.headers()["content-type"];
@@ -1948,12 +2214,6 @@ self.__bx_behaviors.selectMainBehavior();
 
     const { seedId, extraHops } = data;
 
-    const seed = await this.crawlState.getSeedAt(
-      this.seeds,
-      this.numOriginalSeeds,
-      seedId,
-    );
-
     if (!seed) {
       logger.error(
         "Seed not found, likely invalid crawl state - skipping link extraction and behaviors",
@@ -2002,17 +2262,19 @@ self.__bx_behaviors.selectMainBehavior();
   }
 
   async awaitPageLoad(frame: Frame, logDetails: LogDetails) {
-    logger.debug(
-      "Waiting for custom page load via behavior",
-      logDetails,
-      "behavior",
-    );
-    try {
-      await frame.evaluate(
-        "self.__bx_behaviors && self.__bx_behaviors.awaitPageLoad();",
-      );
-    } catch (e) {
-      logger.warn("Waiting for custom page load failed", e, "behavior");
+    if (this.params.behaviorOpts) {
+      try {
+        await timedRun(
+          frame.evaluate(
+            "self.__bx_behaviors && self.__bx_behaviors.awaitPageLoad();",
+          ),
+          PAGE_OP_TIMEOUT_SECS,
+          "Custom page load check timed out",
+          logDetails,
+        );
+      } catch (e) {
+        logger.warn("Waiting for custom page load failed", e, "behavior");
+      }
     }
 
     if (this.params.postLoadDelay) {
@@ -2042,46 +2304,18 @@ self.__bx_behaviors.selectMainBehavior();
       );
     };
 
-    const loadLinks = (options: {
-      selector: string;
-      extract: string;
-      isAttribute: boolean;
-      addLinkFunc: string;
-    }) => {
-      const { selector, extract, isAttribute, addLinkFunc } = options;
-      const urls = new Set<string>();
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const getAttr = (elem: any) => urls.add(elem.getAttribute(extract));
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const getProp = (elem: any) => urls.add(elem[extract]);
-
-      const getter = isAttribute ? getAttr : getProp;
-
-      document.querySelectorAll(selector).forEach(getter);
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const func = (window as any)[addLinkFunc] as (
-        url: string,
-      ) => NonNullable<unknown>;
-      urls.forEach((url) => func.call(this, url));
-
-      return true;
-    };
-
     const frames = filteredFrames || page.frames();
 
     try {
-      for (const { selector, extract, isAttribute } of selectors) {
+      for (const { selector, extract, attrOnly } of selectors) {
         await Promise.allSettled(
           frames.map((frame) => {
             const getLinks = frame
-              .evaluate(loadLinks, {
-                selector,
-                extract,
-                isAttribute,
-                addLinkFunc: ADD_LINK_FUNC,
-              })
+              .evaluate(
+                `self.__bx_behaviors.extractLinks(${JSON.stringify(
+                  selector,
+                )}, ${JSON.stringify(extract)}, ${attrOnly})`,
+              )
               .catch((e) =>
                 logger.warn("Link Extraction failed in frame", {
                   frameUrl: frame.url,
@@ -2289,12 +2523,6 @@ self.__bx_behaviors.selectMainBehavior();
       row.status = status;
     }
 
-    if (this.params.writePagesToRedis) {
-      await this.crawlState.writeToPagesQueue(
-        JSON.stringify(this.pageEntryForRedis(row, state)),
-      );
-    }
-
     if (depth === 0) {
       row.seed = true;
     }
@@ -2303,12 +2531,18 @@ self.__bx_behaviors.selectMainBehavior();
       row.depth = depth;
     }
 
-    if (text && this.textInPages) {
-      row.text = text;
-    }
-
     if (favicon) {
       row.favIconUrl = favicon;
+    }
+
+    if (this.params.writePagesToRedis) {
+      await this.crawlState.writeToPagesQueue(
+        this.pageEntryForRedis(row, state),
+      );
+    }
+
+    if (text && this.textInPages) {
+      row.text = text;
     }
 
     const processedRow = JSON.stringify(row) + "\n";
@@ -2550,13 +2784,11 @@ self.__bx_behaviors.selectMainBehavior();
 
     this.lastSaveTime = now.getTime();
 
-    const ts = now.toISOString().slice(0, 19).replace(/[T:-]/g, "");
-
     const crawlDir = path.join(this.collDir, "crawls");
 
     await fsp.mkdir(crawlDir, { recursive: true });
 
-    const filenameOnly = `crawl-${ts}-${this.params.crawlId}.yaml`;
+    const filenameOnly = `${interpolateFilename("@ts-@id", this.crawlId)}.yaml`;
 
     const filename = path.join(crawlDir, filenameOnly);
 
@@ -2565,8 +2797,9 @@ self.__bx_behaviors.selectMainBehavior();
     if (this.origConfig) {
       this.origConfig.state = state;
     }
-    const res = yaml.dump(this.origConfig, { lineWidth: -1 });
+
     try {
+      const res = yaml.dump(this.origConfig, { lineWidth: -1 });
       logger.info(`Saving crawl state to: ${filename}`);
       await fsp.writeFile(filename, res);
     } catch (e) {
@@ -2574,7 +2807,9 @@ self.__bx_behaviors.selectMainBehavior();
       return;
     }
 
-    this.saveStateFiles.push(filename);
+    if (!this.saveStateFiles.includes(filename)) {
+      this.saveStateFiles.push(filename);
+    }
 
     if (this.saveStateFiles.length > this.params.saveStateHistory) {
       const oldFilename = this.saveStateFiles.shift();
@@ -2587,9 +2822,7 @@ self.__bx_behaviors.selectMainBehavior();
     }
 
     if (this.storage && done && this.params.saveState === "always") {
-      const targetFilename = interpolateFilename(filenameOnly, this.crawlId);
-
-      await this.storage.uploadFile(filename, targetFilename);
+      await this.storage.uploadFile(filename, filenameOnly);
     }
   }
 
@@ -2616,6 +2849,7 @@ self.__bx_behaviors.selectMainBehavior();
     logDetails: Record<string, string>,
   ) {
     const filenameTemplate = `${filenameBase}.warc${gzip ? ".gz" : ""}`;
+    const useSHA1 = this.params.useSHA1;
 
     return new WARCWriter({
       archivesDir: this.archivesDir,
@@ -2623,6 +2857,7 @@ self.__bx_behaviors.selectMainBehavior();
       filenameTemplate,
       rolloverSize: this.params.rolloverSize,
       gzip,
+      useSHA1,
       logDetails,
     });
   }
@@ -2679,7 +2914,6 @@ function getDownloadResponse(req: HTTPRequest) {
       return resp;
     }
   } catch (e) {
-    console.log(e);
     // ignore
   }
 

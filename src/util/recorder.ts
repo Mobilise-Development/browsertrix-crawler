@@ -8,7 +8,7 @@ import {
   isRedirectStatus,
 } from "./reqresp.js";
 
-import { fetch, getGlobalDispatcher, Response } from "undici";
+import { fetch, Response } from "undici";
 
 import {
   getCustomRewriter,
@@ -23,6 +23,9 @@ import { WARCWriter } from "./warcwriter.js";
 import { RedisCrawlState, WorkerId } from "./state.js";
 import { CDPSession, Protocol } from "puppeteer-core";
 import { Crawler } from "../crawler.js";
+import { getProxyDispatcher } from "./proxy.js";
+import { ScopedSeed } from "./seeds.js";
+import EventEmitter from "events";
 
 const MAX_BROWSER_DEFAULT_FETCH_SIZE = 5_000_000;
 const MAX_TEXT_REWRITE_SIZE = 25_000_000;
@@ -115,7 +118,7 @@ export type ResponseStreamAsyncFetchOptions = NetworkLoadAsyncFetchOptions & {
 };
 
 // =================================================================
-export class Recorder {
+export class Recorder extends EventEmitter {
   workerid: WorkerId;
 
   crawler: Crawler;
@@ -127,6 +130,7 @@ export class Recorder {
   pendingRequests!: Map<string, RequestResponseInfo>;
   skipIds!: Set<string>;
   pageInfo!: PageInfoRecord;
+  mainFrameId: string | null = null;
   skipRangeUrls!: Map<string, number>;
 
   swTargetId?: string | null;
@@ -146,6 +150,8 @@ export class Recorder {
   pageUrl!: string;
   pageid!: string;
 
+  pageSeed?: ScopedSeed;
+
   frameIdToExecId: Map<string, number> | null;
 
   constructor({
@@ -157,6 +163,7 @@ export class Recorder {
     writer: WARCWriter;
     crawler: Crawler;
   }) {
+    super();
     this.workerid = workerid;
     this.crawler = crawler;
     this.crawlState = crawler.crawlState;
@@ -449,10 +456,14 @@ export class Recorder {
             { url, ...this.logDetails },
             "recorder",
           );
+          reqresp.deleteRange();
+          reqresp.requestId = "0";
+
           const fetcher = new AsyncFetcher({
             reqresp,
+            expectedSize: reqresp.expectedSize ? reqresp.expectedSize : -1,
             recorder: this,
-            networkId: requestId,
+            networkId: "0",
           });
           void this.fetcherQ.add(() => fetcher.load());
           return;
@@ -531,6 +542,7 @@ export class Recorder {
         !responseErrorReason &&
         !this.shouldSkip(headers, url, method, resourceType)
       ) {
+        this.emit("fetching", { url });
         continued = await this.handleFetchResponse(
           params,
           cdp,
@@ -574,6 +586,12 @@ export class Recorder {
 
     const networkId = params.networkId || requestId;
 
+    const reqresp = this.pendingReqResp(networkId);
+
+    if (!reqresp) {
+      return false;
+    }
+
     if (responseErrorReason) {
       logger.warn(
         "Skipping failed response",
@@ -601,24 +619,23 @@ export class Recorder {
         );
         this.removeReqResp(networkId);
 
-        const reqresp = new RequestResponseInfo("0");
-        reqresp.fillRequest(params.request, params.resourceType);
-        if (reqresp.requestHeaders) {
-          delete reqresp.requestHeaders["range"];
-          delete reqresp.requestHeaders["Range"];
-        }
-        reqresp.frameId = params.frameId;
+        if (!reqresp.fetchContinued) {
+          const reqrespNew = new RequestResponseInfo("0");
+          reqrespNew.fillRequest(params.request, params.resourceType);
+          reqrespNew.deleteRange();
+          reqrespNew.frameId = params.frameId;
 
-        this.addAsyncFetch(
-          {
-            reqresp,
-            expectedSize: parseInt(range.split("/")[1]),
-            recorder: this,
-            networkId: "0",
-            cdp,
-          },
-          contentLen,
-        );
+          this.addAsyncFetch(
+            {
+              reqresp: reqrespNew,
+              expectedSize: parseInt(range.split("/")[1]),
+              recorder: this,
+              networkId: "0",
+              cdp,
+            },
+            contentLen,
+          );
+        }
 
         return false;
       } else {
@@ -651,25 +668,21 @@ export class Recorder {
           "recorder",
         );
 
-        const reqresp = new RequestResponseInfo("0");
-        reqresp.fillRequest(params.request, params.resourceType);
-        reqresp.url = filteredUrl;
-        reqresp.frameId = params.frameId;
+        if (!reqresp.fetchContinued) {
+          const reqrespNew = new RequestResponseInfo("0");
+          reqrespNew.fillRequest(params.request, params.resourceType);
+          reqrespNew.url = filteredUrl;
+          reqrespNew.frameId = params.frameId;
 
-        this.addAsyncFetch({
-          reqresp,
-          recorder: this,
-          networkId: "0",
-          cdp,
-        });
+          this.addAsyncFetch({
+            reqresp: reqrespNew,
+            recorder: this,
+            networkId: "0",
+            cdp,
+          });
+        }
         return false;
       }
-    }
-
-    const reqresp = this.pendingReqResp(networkId);
-
-    if (!reqresp) {
-      return false;
     }
 
     // indicate that this is intercepted in the page context
@@ -684,11 +697,27 @@ export class Recorder {
 
     reqresp.fetchContinued = true;
 
+    reqresp.fillFetchRequestPaused(params);
+
     if (
       url === this.pageUrl &&
       (!this.pageInfo.ts ||
-        (responseStatusCode && responseStatusCode < this.pageInfo.tsStatus))
+        (responseStatusCode && responseStatusCode <= this.pageInfo.tsStatus))
     ) {
+      const errorReason = await this.blockPageResponse(
+        url,
+        reqresp,
+        responseHeaders,
+      );
+
+      if (errorReason) {
+        await cdp.send("Fetch.failRequest", {
+          requestId,
+          errorReason,
+        });
+        return true;
+      }
+
       logger.debug("Setting page timestamp", {
         ts: reqresp.ts,
         url,
@@ -696,9 +725,8 @@ export class Recorder {
       });
       this.pageInfo.ts = reqresp.ts;
       this.pageInfo.tsStatus = responseStatusCode!;
+      this.mainFrameId = params.frameId;
     }
-
-    reqresp.fillFetchRequestPaused(params);
 
     if (this.noResponseForStatus(responseStatusCode)) {
       reqresp.payload = new Uint8Array();
@@ -842,6 +870,55 @@ export class Recorder {
     void this.fetcherQ.add(() => fetcher.load());
   }
 
+  addExternalFetch(url: string, cdp: CDPSession) {
+    logger.debug(
+      "Handling fetch from behavior",
+      { url, ...this.logDetails },
+      "recorder",
+    );
+    const reqresp = new RequestResponseInfo("0");
+    reqresp.url = url;
+    reqresp.method = "GET";
+    reqresp.frameId = this.mainFrameId || undefined;
+    const fetcher = new NetworkLoadStreamAsyncFetcher({
+      reqresp,
+      recorder: this,
+      cdp,
+      networkId: "0",
+    });
+    void this.fetcherQ.add(() => fetcher.load());
+    // return true if successful
+    return true;
+  }
+
+  async blockPageResponse(
+    url: string,
+    reqresp: RequestResponseInfo,
+    responseHeaders?: Protocol.Fetch.HeaderEntry[],
+  ): Promise<Protocol.Network.ErrorReason | undefined> {
+    if (reqresp.isRedirectStatus()) {
+      try {
+        let loc = this.getLocation(responseHeaders);
+        if (loc) {
+          loc = new URL(loc, url).href;
+
+          if (this.pageSeed && this.pageSeed.isExcluded(loc)) {
+            logger.warn(
+              "Skipping page that redirects to excluded URL",
+              { newUrl: loc, origUrl: this.pageUrl },
+              "recorder",
+            );
+
+            return "BlockedByResponse";
+          }
+        }
+      } catch (e) {
+        // ignore
+        logger.debug("Redirect check error", e, "recorder");
+      }
+    }
+  }
+
   startPage({ pageid, url }: { pageid: string; url: string }) {
     this.pageid = pageid;
     this.pageUrl = url;
@@ -864,6 +941,7 @@ export class Recorder {
       counts: { jsErrors: 0 },
       tsStatus: 999,
     };
+    this.mainFrameId = null;
   }
 
   addPageRecord(reqresp: RequestResponseInfo) {
@@ -927,7 +1005,7 @@ export class Recorder {
     while (
       numPending &&
       !this.pageFinished &&
-      !this.crawler.interrupted &&
+      !this.crawler.interruptReason &&
       !this.crawler.postCrawling
     ) {
       pending = [];
@@ -1156,6 +1234,21 @@ export class Recorder {
     for (const header of headers) {
       if (header.name.toLowerCase() === "content-type") {
         return header.value.split(";")[0];
+      }
+    }
+
+    return null;
+  }
+
+  protected getLocation(
+    headers?: Protocol.Fetch.HeaderEntry[] | { name: string; value: string }[],
+  ) {
+    if (!headers) {
+      return null;
+    }
+    for (const header of headers) {
+      if (header.name.toLowerCase() === "location") {
+        return header.value;
       }
     }
 
@@ -1485,6 +1578,7 @@ class AsyncFetcher {
         logger.warn(
           "Async fetch: possible response size mismatch",
           {
+            type: this.constructor.name,
             size: reqresp.readSize,
             expected: reqresp.expectedSize,
             url,
@@ -1492,7 +1586,8 @@ class AsyncFetcher {
           },
           "recorder",
         );
-        if (status === 206) {
+        if (status === 206 || status === 200) {
+          void serializer.externalBuffer?.purge();
           await crawlState.removeDupe(ASYNC_FETCH_DUPE_KEY, url, status);
           return "notfetched";
         }
@@ -1562,14 +1657,18 @@ class AsyncFetcher {
 
     const headers = reqresp.getRequestHeadersDict();
 
-    const dispatcher = getGlobalDispatcher().compose((dispatch) => {
-      return (opts, handler) => {
-        if (opts.headers) {
-          reqresp.requestHeaders = opts.headers as Record<string, string>;
-        }
-        return dispatch(opts, handler);
-      };
-    });
+    let dispatcher = getProxyDispatcher();
+
+    if (dispatcher) {
+      dispatcher = dispatcher.compose((dispatch) => {
+        return (opts, handler) => {
+          if (opts.headers) {
+            reqresp.requestHeaders = opts.headers as Record<string, string>;
+          }
+          return dispatch(opts, handler);
+        };
+      });
+    }
 
     const resp = await fetch(url!, {
       method,

@@ -5,14 +5,16 @@ import { fetch } from "undici";
 import util from "util";
 import { exec as execCallback } from "child_process";
 
-import { logger } from "./logger.js";
+import { formatErr, logger } from "./logger.js";
+import { getProxyDispatcher } from "./proxy.js";
+import { parseRecorderFlowJson } from "./flowbehavior.js";
 
 const exec = util.promisify(execCallback);
 
-const MAX_DEPTH = 2;
+const MAX_DEPTH = 5;
 
 // Add .ts to allowed extensions when we can support it
-const ALLOWED_EXTS = [".js"];
+const ALLOWED_EXTS = [".js", ".json"];
 
 export type FileSource = {
   path: string;
@@ -71,7 +73,7 @@ async function collectGitBehaviors(gitUrl: string): Promise<FileSources> {
     );
     return await collectLocalPathBehaviors(pathToCollect);
   } catch (e) {
-    logger.error(
+    logger.fatal(
       "Error downloading custom behaviors from Git repo",
       { url: urlStripped, error: e },
       "behavior",
@@ -81,11 +83,13 @@ async function collectGitBehaviors(gitUrl: string): Promise<FileSources> {
 }
 
 async function collectOnlineBehavior(url: string): Promise<FileSources> {
-  const filename = crypto.randomBytes(4).toString("hex") + ".js";
-  const behaviorFilepath = `/app/behaviors/${filename}`;
+  const filename = path.basename(new URL(url).pathname);
+  const tmpDir = `/tmp/behaviors-${crypto.randomBytes(4).toString("hex")}`;
+  await fsp.mkdir(tmpDir, { recursive: true });
+  const behaviorFilepath = path.join(tmpDir, filename);
 
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { dispatcher: getProxyDispatcher() });
     const fileContents = await res.text();
     await fsp.writeFile(behaviorFilepath, fileContents);
     logger.info(
@@ -93,9 +97,9 @@ async function collectOnlineBehavior(url: string): Promise<FileSources> {
       { url, path: behaviorFilepath },
       "behavior",
     );
-    return await collectLocalPathBehaviors(behaviorFilepath);
+    return await collectLocalPathBehaviors(behaviorFilepath, 0, url);
   } catch (e) {
-    logger.error(
+    logger.fatal(
       "Error downloading custom behavior from URL",
       { url, error: e },
       "behavior",
@@ -107,8 +111,10 @@ async function collectOnlineBehavior(url: string): Promise<FileSources> {
 async function collectLocalPathBehaviors(
   fileOrDir: string,
   depth = 0,
+  source?: string,
 ): Promise<FileSources> {
   const resolvedPath = path.resolve(fileOrDir);
+  const filename = path.basename(resolvedPath);
 
   if (depth >= MAX_DEPTH) {
     logger.warn(
@@ -119,37 +125,75 @@ async function collectLocalPathBehaviors(
     return [];
   }
 
-  const stat = await fsp.stat(resolvedPath);
-
-  if (stat.isFile() && ALLOWED_EXTS.includes(path.extname(resolvedPath))) {
-    const contents = await fsp.readFile(resolvedPath);
-    return [
-      {
-        path: resolvedPath,
-        contents: `/* src: ${resolvedPath} */\n\n${contents}`,
-      },
-    ];
-  }
-
   const behaviors: FileSources = [];
 
-  const isDir = stat.isDirectory();
+  try {
+    const stat = await fsp.stat(resolvedPath);
 
-  if (!isDir && depth === 0) {
-    logger.warn(
-      "The provided path is not a .js file or directory",
-      { path: resolvedPath },
+    if (stat.isFile() && ALLOWED_EXTS.includes(path.extname(resolvedPath))) {
+      source = source ?? filename;
+      logger.info("Custom behavior script added", { source }, "behavior");
+      let contents = await fsp.readFile(resolvedPath, { encoding: "utf-8" });
+      if (path.extname(resolvedPath) === ".json") {
+        try {
+          contents = parseRecorderFlowJson(contents, source);
+        } catch (e) {
+          logger.fatal(
+            "Unable to parse recorder flow JSON, ignored",
+            formatErr(e),
+            "behavior",
+          );
+        }
+      }
+
+      return [
+        {
+          path: resolvedPath,
+          contents: `/* src: ${resolvedPath} */\n\n${contents}`,
+        },
+      ];
+    }
+
+    const isDir = stat.isDirectory();
+
+    // ignore .git directory of git repositories
+    if (isDir && filename === ".git") {
+      return [];
+    }
+
+    if (!isDir && depth === 0) {
+      logger.warn(
+        "The provided path is not a .js file or directory",
+        { path: resolvedPath },
+        "behavior",
+      );
+    }
+
+    if (isDir) {
+      const files = await fsp.readdir(resolvedPath);
+      for (const file of files) {
+        const filePath = path.join(resolvedPath, file);
+        const newBehaviors = await collectLocalPathBehaviors(
+          filePath,
+          depth + 1,
+        );
+        behaviors.push(...newBehaviors);
+      }
+    }
+  } catch (e) {
+    logger.fatal(
+      "Error fetching local custom behaviors",
+      { path: resolvedPath, error: e },
       "behavior",
     );
   }
 
-  if (isDir) {
-    const files = await fsp.readdir(resolvedPath);
-    for (const file of files) {
-      const filePath = path.join(resolvedPath, file);
-      const newBehaviors = await collectLocalPathBehaviors(filePath, depth + 1);
-      behaviors.push(...newBehaviors);
-    }
+  if (!behaviors && depth === 0) {
+    logger.fatal(
+      "No custom behaviors found at specified path",
+      { path: resolvedPath },
+      "behavior",
+    );
   }
 
   return behaviors;

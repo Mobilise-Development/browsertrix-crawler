@@ -3,9 +3,10 @@ import { v4 as uuidv4 } from "uuid";
 
 import { logger } from "./logger.js";
 
-import { MAX_DEPTH } from "./constants.js";
+import { MAX_DEPTH, DEFAULT_MAX_RETRIES } from "./constants.js";
 import { ScopedSeed } from "./seeds.js";
 import { Frame } from "puppeteer-core";
+import { interpolateFilename } from "./storage.js";
 
 // ============================================================================
 export enum LoadState {
@@ -35,6 +36,7 @@ export type QueueEntry = {
   extraHops: number;
   ts?: number;
   pageid?: string;
+  retry?: number;
 };
 
 // ============================================================================
@@ -54,6 +56,7 @@ export class PageState {
   seedId: number;
   depth: number;
   extraHops: number;
+  retry: number;
 
   status: number;
 
@@ -72,6 +75,7 @@ export class PageState {
   favicon?: string;
 
   skipBehaviors = false;
+  pageSkipped = false;
   filteredFrames: Frame[] = [];
   loadState: LoadState = LoadState.FAILED;
 
@@ -87,6 +91,7 @@ export class PageState {
     }
     this.pageid = redisData.pageid || uuidv4();
     this.status = 0;
+    this.retry = redisData.retry || 0;
   }
 }
 
@@ -115,14 +120,6 @@ declare module "ioredis" {
       uid: string,
     ): Result<void, Context>;
 
-    movefailed(
-      pkey: string,
-      fkey: string,
-      url: string,
-      value: string,
-      state: string,
-    ): Result<void, Context>;
-
     unlockpending(
       pkeyUrl: string,
       uid: string,
@@ -134,7 +131,16 @@ declare module "ioredis" {
       qkey: string,
       pkeyUrl: string,
       url: string,
-      maxRetryPending: number,
+      maxRetries: number,
+      maxRegularDepth: number,
+    ): Result<number, Context>;
+
+    requeuefailed(
+      pkey: string,
+      qkey: string,
+      fkey: string,
+      url: string,
+      maxRetries: number,
       maxRegularDepth: number,
     ): Result<number, Context>;
 
@@ -163,7 +169,7 @@ export type SaveState = {
 // ============================================================================
 export class RedisCrawlState {
   redis: Redis;
-  maxRetryPending = 1;
+  maxRetries: number;
 
   uid: string;
   key: string;
@@ -175,28 +181,40 @@ export class RedisCrawlState {
   dkey: string;
   fkey: string;
   ekey: string;
+  bkey: string;
   pageskey: string;
   esKey: string;
   esMap: string;
 
   sitemapDoneKey: string;
 
-  constructor(redis: Redis, key: string, maxPageTime: number, uid: string) {
+  waczFilename: string | null = null;
+
+  constructor(
+    redis: Redis,
+    key: string,
+    maxPageTime: number,
+    uid: string,
+    maxRetries?: number,
+  ) {
     this.redis = redis;
 
     this.uid = uid;
     this.key = key;
     this.maxPageTime = maxPageTime;
+    this.maxRetries = maxRetries ?? DEFAULT_MAX_RETRIES;
 
     this.qkey = this.key + ":q";
     this.pkey = this.key + ":p";
     this.skey = this.key + ":s";
     // done (integer)
     this.dkey = this.key + ":d";
-    // failed
+    // failed final, no more retry
     this.fkey = this.key + ":f";
     // crawler errors
     this.ekey = this.key + ":e";
+    // crawler behavior script messages
+    this.bkey = this.key + ":b";
     // pages
     this.pageskey = this.key + ":pages";
 
@@ -269,19 +287,29 @@ end
 `,
     });
 
-    redis.defineCommand("movefailed", {
-      numberOfKeys: 2,
+    redis.defineCommand("requeuefailed", {
+      numberOfKeys: 3,
       lua: `
 local json = redis.call('hget', KEYS[1], ARGV[1]);
 
 if json then
   local data = cjson.decode(json);
-  data[ARGV[3]] = ARGV[2];
-  json = cjson.encode(data);
+  local retry = data['retry'] or 0;
 
-  redis.call('lpush', KEYS[2], json);
   redis.call('hdel', KEYS[1], ARGV[1]);
+
+  if retry < tonumber(ARGV[2]) then
+    retry = retry + 1;
+    data['retry'] = retry;
+    json = cjson.encode(data);
+    local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]) + (retry * ARGV[3] * 2);
+    redis.call('zadd', KEYS[2], score, json);
+    return retry;
+  else
+    redis.call('lpush', KEYS[3], json);
+  end
 end
+return -1;
 
 `,
     });
@@ -294,11 +322,15 @@ if not res then
   local json = redis.call('hget', KEYS[1], ARGV[1]);
   if json then
     local data = cjson.decode(json);
-    data['retry'] = (data['retry'] or 0) + 1;
+    local retry = data['retry'] or 0;
+
     redis.call('hdel', KEYS[1], ARGV[1]);
-    if tonumber(data['retry']) <= tonumber(ARGV[2]) then
+
+    if retry < tonumber(ARGV[2]) then
+      retry = retry + 1;
+      data['retry'] = retry;
       json = cjson.encode(data);
-      local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]);
+      local score = (data['depth'] or 0) + ((data['extraHops'] or 0) * ARGV[3]) + (retry * ARGV[3] * 2);
       redis.call('zadd', KEYS[2], score, json);
       return 1;
     else
@@ -353,10 +385,15 @@ return inx;
     return await this.redis.incr(this.dkey);
   }
 
-  async markFailed(url: string) {
-    await this.redis.movefailed(this.pkey, this.fkey, url, "1", "failed");
-
-    return await this.redis.incr(this.dkey);
+  async markFailed(url: string, noRetries = false) {
+    return await this.redis.requeuefailed(
+      this.pkey,
+      this.qkey,
+      this.fkey,
+      url,
+      noRetries ? 0 : this.maxRetries,
+      MAX_DEPTH,
+    );
   }
 
   async markExcluded(url: string) {
@@ -381,6 +418,47 @@ return inx;
 
   async getStatus(): Promise<string> {
     return (await this.redis.hget(`${this.key}:status`, this.uid)) || "";
+  }
+
+  async setWACZFilename(): Promise<string> {
+    const filename = process.env.STORE_FILENAME || "@ts-@id.wacz";
+    this.waczFilename = interpolateFilename(filename, this.key);
+    if (
+      !(await this.redis.hsetnx(
+        `${this.key}:nextWacz`,
+        this.uid,
+        this.waczFilename,
+      ))
+    ) {
+      this.waczFilename = await this.redis.hget(
+        `${this.key}:nextWacz`,
+        this.uid,
+      );
+      logger.debug(
+        "Keeping WACZ Filename",
+        { filename: this.waczFilename },
+        "state",
+      );
+    } else {
+      logger.debug(
+        "Using New WACZ Filename",
+        { filename: this.waczFilename },
+        "state",
+      );
+    }
+    return this.waczFilename!;
+  }
+
+  async getWACZFilename(): Promise<string> {
+    if (!this.waczFilename) {
+      return await this.setWACZFilename();
+    }
+    return this.waczFilename;
+  }
+
+  async clearWACZFilename(): Promise<void> {
+    await this.redis.hdel(`${this.key}:nextWacz`, this.uid);
+    this.waczFilename = null;
   }
 
   async setArchiveSize(size: number) {
@@ -544,16 +622,17 @@ return inx;
 
   async nextFromQueue() {
     const json = await this._getNext();
+
+    if (!json) {
+      return null;
+    }
+
     let data;
 
     try {
       data = JSON.parse(json);
     } catch (e) {
-      logger.error("Invalid queued json", json, "redis");
-      return null;
-    }
-
-    if (!data) {
+      logger.error("Invalid queued json", json, "state");
       return null;
     }
 
@@ -591,7 +670,11 @@ return inx;
   }
 
   _getScore(data: QueueEntry) {
-    return (data.depth || 0) + (data.extraHops || 0) * MAX_DEPTH;
+    return (
+      (data.depth || 0) +
+      (data.extraHops || 0) * MAX_DEPTH +
+      (data.retry || 0) * MAX_DEPTH * 2
+    );
   }
 
   async _iterSet(key: string, count = 100) {
@@ -749,7 +832,13 @@ return inx;
 
     for (const json of state.failed) {
       const data = JSON.parse(json);
-      await this.redis.zadd(this.qkey, this._getScore(data), json);
+      const retry = data.retry || 0;
+      // allow retrying failed URLs if number of retries has increased
+      if (retry < this.maxRetries) {
+        await this.redis.zadd(this.qkey, this._getScore(data), json);
+      } else {
+        await this.redis.rpush(this.fkey, json);
+      }
       seen.push(data.url);
     }
 
@@ -810,7 +899,7 @@ return inx;
         this.qkey,
         this.pkey + ":" + url,
         url,
-        this.maxRetryPending,
+        this.maxRetries,
         MAX_DEPTH,
       );
       switch (res) {
@@ -837,12 +926,27 @@ return inx;
     return await this.redis.srem(key, status + "|" + url);
   }
 
+  async isInUserSet(value: string) {
+    return (await this.redis.sismember(this.key + ":user", value)) === 1;
+  }
+
+  async addToUserSet(value: string) {
+    return (await this.redis.sadd(this.key + ":user", value)) === 1;
+  }
+
   async logError(error: string) {
     return await this.redis.lpush(this.ekey, error);
   }
 
-  async writeToPagesQueue(value: string) {
-    return await this.redis.lpush(this.pageskey, value);
+  async logBehavior(behaviorLog: string) {
+    return await this.redis.lpush(this.bkey, behaviorLog);
+  }
+
+  async writeToPagesQueue(
+    data: Record<string, string | number | boolean | object>,
+  ) {
+    data["filename"] = await this.getWACZFilename();
+    return await this.redis.lpush(this.pageskey, JSON.stringify(data));
   }
 
   // add extra seeds from redirect
